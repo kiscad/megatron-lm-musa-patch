@@ -36,8 +36,12 @@ def patch_before_import_megatron():
         from . import fault_tolerance_epx
         from . import parallel_state
     from . import optimizer
-    if int(os.getenv("ENABLE_D2H_IN_PERMUTATION", 0)):
-        from . import token_dispatcher
+    if int(os.getenv("USE_EPX", 0)):
+        from . import parallel_state
+        from . import fault_tolerance_epx
+    # if int(os.getenv("ENABLE_D2H_IN_PERMUTATION", 0)):
+    #     from . import token_dispatcher
+    from . import token_dispatcher
 
     from . import core_pipeline_parallel_schedules
     from . import yarn_rotary_pos_embedding
