@@ -1,15 +1,26 @@
 import os
 import torch
 from functools import partial
+from typing import Optional
 from megatron.core import tensor_parallel, parallel_state
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+from megatron.core.utils import deprecate_inference_params
+
 try:
-    from transformer_engine.pytorch.distributed import checkpoint
-    from transformer_engine.pytorch.distributed import checkpointViranceAttention
+    from transformer_engine.pytorch.distributed import checkpoint, checkpointViranceAttention
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+try:
+    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+        fused_apply_mla_rope_for_kv,
+        fused_apply_mla_rope_for_q,
+    )
+except:
+    fused_apply_mla_rope_for_kv = None
+    fused_apply_mla_rope_for_q = None
 
 # HACK(huang.huang): recompute-variance for fa: 
 # 1. modify get_query_key_value_tensors for MLASelfAttention, just add a logic to call recompute;
@@ -35,7 +46,7 @@ class RoPEQInplace(torch.autograd.Function):
         assert (split_end - split_start) == freqs.shape[-1]
         assert x.shape[batch_first] == freqs.shape[0]
         ctx.save_for_backward(freqs)
-        y = torch.ops.aten._fused_rope_forward(
+        y = torch.ops.aten._fused_rope_forward( # type: ignore
             x[..., split_start:split_end], freqs, rotary_interleaved, batch_first
         )
         # x.data[..., split_start:split_end] = y # Using `tensor.data` does not affect `tensor._version`.
@@ -43,7 +54,7 @@ class RoPEQInplace(torch.autograd.Function):
         return x
 
     @staticmethod
-    def backward(ctx, dy):
+    def backward(ctx, dy): # type: ignore
         (freqs,) = ctx.saved_tensors
         (
             split_start,
@@ -52,7 +63,7 @@ class RoPEQInplace(torch.autograd.Function):
             batch_first,
         ) = ctx.custom_metadata
         sub_dy = dy[..., split_start:split_end]
-        dx = torch.ops.aten._fused_rope_backward(
+        dx = torch.ops.aten._fused_rope_backward( # type: ignore
             sub_dy, freqs, rotary_interleaved, batch_first
         )
         dy[..., split_start:split_end] = dx
@@ -60,8 +71,8 @@ class RoPEQInplace(torch.autograd.Function):
 
 
 def MLASelfAttention_forward(
-    self,
-    hidden_states,
+    self: "MLASelfAttention",
+    hidden_states: Optional[torch.Tensor],
     attention_mask,
     key_value_states=None,
     inference_context=None,
@@ -72,12 +83,15 @@ def MLASelfAttention_forward(
     packed_seq_params=None,
     position_ids=None,
     sequence_len_offset=None,
+
     q_compressed=None,
     kv_combined=None,
+    *,
+    inference_params=None,
 ):
     if not int(os.getenv("USE_RECOMPUTE_VARIANCE", 0)):
         #original forward
-        return super(MLASelfAttention ,self).forward(
+        return super(MLASelfAttention, self).forward(
             hidden_states,
             attention_mask,
             key_value_states,
@@ -88,7 +102,9 @@ def MLASelfAttention_forward(
             attention_bias,
             packed_seq_params,
             position_ids,
-            sequence_len_offset
+            sequence_len_offset,
+
+            inference_params=inference_params
             )
     
     """Forward pass for multi-latent attention"""
@@ -100,6 +116,8 @@ def MLASelfAttention_forward(
 
     # hidden_states: [sq, b, h]
 
+    inference_context = deprecate_inference_params(inference_context, inference_params)
+
     # =====================
     # Query, Key, and Value
     # =====================
@@ -108,7 +126,10 @@ def MLASelfAttention_forward(
     # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
     if self.config.mla_rms_recompute:
         assert self.config.attn_recompute, 'mla_rms_recompute only use with attn_recompute now.'
-        pass
+
+        if packed_seq_params is not None:
+            q_compressed = q_compressed.squeeze(1)
+            kv_combined = kv_combined.squeeze(1)
     else:
         assert (
             hidden_states.ndim == 3
@@ -119,113 +140,159 @@ def MLASelfAttention_forward(
         else:
             q_compressed = hidden_states      
 
-        kv_combined, _ = self.linear_kv_down_proj(hidden_states)    
+        kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+
+        if packed_seq_params is not None:
+            q_compressed = q_compressed.squeeze(1)
+            kv_combined = kv_combined.squeeze(1)
 
     def _custom_forward_before_attention(
         q_compressed, 
         kv_combined,
+        attention_mask,
         key_value_states=None,
         position_ids=None,
         packed_seq_params=None,
         inference_context=None,
     ):
-        q_len, bsz, _ = q_compressed.size()
-
+        # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
         if self.config.q_lora_rank is not None:
             q_compressed = self.q_layernorm(q_compressed)
             q, _ = self.linear_q_up_proj(q_compressed)
         else:
             q, _ = self.linear_q_proj(q_compressed)
         
-        # q: [s, b, n, 192]
-        q = q.view(q_len, bsz, self.num_attention_heads_per_partition, self.q_head_dim)
+        # q: [num_tokens, n, q_head_dim]
+        q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
-        # q: [s, b, n, 128], q_pos_emb: [s, b, n, 64]
-        q_no_pe, q_pos_emb = torch.split(
-            q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
-        )
-
-
-        # kv_compressed:[s, b, 512], k_pos_emb: [s, b, 64]
+        # kv_compressed:[s, b, kv_lora_rank], k_pos_emb: [s, b, qk_pos_emb_head_dim]
         kv_compressed, k_pos_emb = torch.split(
             kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
         )
+        # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
         kv, _ = self.linear_kv_up_proj(self.kv_layernorm(kv_compressed))
 
-        # kv: [s, b, n, 256]
+        # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
         kv = kv.view(
-            q_len,
-            bsz,
+            *kv.size()[:-1],
             self.num_attention_heads_per_partition,
             self.config.qk_head_dim + self.config.v_head_dim,
         )
-
-        # k_no_pe: [s, b, n, 128], value: [s, b, n, 128]
-        k_no_pe, value = torch.split(kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1)
-
-        # rotary_pos_emb:[s, b, 1, 64]
-        rotary_pos_emb = self.rotary_pos_emb(max_seq_len=self.config.max_position_embeddings)
-
-        if len(rotary_pos_emb) == 2:
-            mscale = rotary_pos_emb[1]
-            rotary_pos_emb = rotary_pos_emb[0]
-
-        if inference_context is not None:
-            # add offset to the sequence start for inference
-            sequence_start = inference_context.sequence_len_offset
-            sequence_end = sequence_start + q_len
-            rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-
-        # [s, b, 64] -> [s, b, 1, 64]
-        k_pos_emb = torch.unsqueeze(k_pos_emb, 2)
+        k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
         if packed_seq_params is not None:
             cu_seqlens_q = packed_seq_params.cu_seqlens_q
             cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
         else:
-            cu_seqlens_q = cu_seqlens_kv = None
+            cu_seqlens_q = cu_seqlens_kv = None   
 
-        # # q_pos_emb: [s, b, n, 64], k_pos_emb:[s, b, 1, 64]
-        # q_pos_emb = apply_rotary_pos_emb(
-        #     q_pos_emb, rotary_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q, mscale=mscale
-        # )
-        k_pos_emb = apply_rotary_pos_emb(
-            k_pos_emb, rotary_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv, mscale=mscale
-        )
+        # rotary_pos_emb:[s, b, 1, 64]
+        mscale = 1.0
+        if self.config.rope_type == "rope":
+            rotary_pos_emb = self.rotary_pos_emb(self.config.max_position_embeddings)
+        elif self.config.apply_rope_fusion:
+            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                self.config.max_position_embeddings, dtype=q_compressed.dtype
+            )
+            rotary_pos_emb = None
+            assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
+            assert (
+                fused_apply_mla_rope_for_q is not None
+                and fused_apply_mla_rope_for_kv is not None
+            ), "Fused MLA RoPE apply is not imported successfully"
+        else:
+            rotary_pos_emb, mscale = self.rotary_pos_emb(self.config.max_position_embeddings)
 
-        # # query: [s, b, n, 192]
-        # query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
-        q_split_start = self.config.qk_head_dim
-        q_split_end = q_split_start + self.config.qk_pos_emb_head_dim
-        rotary_interleaved = False
-        batch_first = False
-        query = RoPEQInplace.apply(q, rotary_pos_emb.squeeze(1).squeeze(1), 
-                                   (q_split_start, q_split_end, rotary_interleaved, batch_first))
+        if self.config.apply_rope_fusion:
+            query = fused_apply_mla_rope_for_q(
+                q,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                self.config.qk_head_dim,
+                self.config.qk_pos_emb_head_dim,
+                cu_seqlens_q,
+            )
+            key, value = fused_apply_mla_rope_for_kv(
+                kv,
+                k_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                self.config.qk_pos_emb_head_dim,
+                self.config.qk_head_dim,
+                self.config.v_head_dim,
+                cu_seqlens_kv,
+            )
+        else:
+            q_len = q.size()[0]
+            if inference_context is not None:
+                # add offset to the sequence start for inference
+                sequence_start = inference_context.sequence_len_offset
+                sequence_end = inference_context + q_len
+                rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end] # type: ignore
+            else:
+                # Shorten rotary_pos_emb to the sequence length when inference_params
+                # is not provided. This makes sure we can run forward directly with
+                # any sequence length. During training, the sequence length is always
+                # the full rotary_pos_emb length.
+                rotary_pos_emb = rotary_pos_emb[0:q_len] # type: ignore
 
-        # key: [s, b, n, 192]
-        k_pos_emb = k_pos_emb.expand(-1, -1, self.config.num_attention_heads, -1)
-        key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+            # k_no_pe: [num_tokens, n, qk_head_dim]
+            # value: [num_tokens, n, v_head_dim]
+            k_no_pe, value = torch.split(
+                kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1)
+            # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+            k_pos_emb = apply_rotary_pos_emb(
+                k_pos_emb, 
+                rotary_pos_emb, 
+                config=self.config, 
+                cu_seqlens=cu_seqlens_kv, 
+                mscale=mscale,
+                cp_group=self.model_comm_pgs.cp
+            )
+
+            # key: [num_tokens, n, (qk_head_dim + v_head_dim)]         
+            if k_pos_emb.ndim == 4:
+                k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+            else:
+                assert k_pos_emb.ndim == 3
+                k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1) 
+            key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+
+            q_split_start = self.config.qk_head_dim
+            q_split_end = q_split_start + self.config.qk_pos_emb_head_dim
+            rotary_interleaved = False
+            batch_first = False
+            query = RoPEQInplace.apply(q, rotary_pos_emb.squeeze(1).squeeze(1), 
+                                    (q_split_start, q_split_end, rotary_interleaved, batch_first))
 
         query = query.contiguous()
         key = key.contiguous()
-        value = value.contiguous()    
-
+        value = value.contiguous()            
+         
         query, key, value, _, attn_mask_type, _ = self._adjust_key_value_for_inference(
-        inference_context, query, key, value, rotary_pos_emb=None
-        )    
+            inference_context, query, key, value, rotary_pos_emb=None
+        )
+
+        # TODO: Currently, TE can only accept contiguous tensors for MLA
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+
         return query, key, value, attention_mask, \
             {"attn_mask_type":attn_mask_type, "attention_bias":attention_bias, "packed_seq_params":packed_seq_params}
         
     def _custom_forward_self_attention(
         q_compressed, 
         kv_combined,
+        attention_mask,
         key_value_states=None,
         position_ids=None,
         packed_seq_params=None,
         inference_context=None,
         ):
         
-        query, key, value, attention_mask, kwargs = _custom_forward_before_attention(q_compressed, kv_combined, key_value_states, position_ids, packed_seq_params,inference_context)
+        query, key, value, attention_mask, kwargs = _custom_forward_before_attention(
+            q_compressed, kv_combined, attention_mask, key_value_states, position_ids, packed_seq_params, inference_context)
         core_attn_out = self.core_attention(query, key, value, attention_mask, **kwargs)
         return core_attn_out       
 
@@ -237,7 +304,6 @@ def MLASelfAttention_forward(
         packed_seq_params=packed_seq_params,
     )
 
-
     custom_forward_before_attention = partial(
         _custom_forward_before_attention,
         key_value_states=key_value_states,
@@ -245,38 +311,40 @@ def MLASelfAttention_forward(
         position_ids=position_ids,
         packed_seq_params=packed_seq_params,
     )
-
-    if self.config.attn_recompute == True:
+    
+    if self.config.attn_recompute:
         if self.config.fp8:
-            if self.config.recompute_variance == True:
+            if self.config.recompute_variance:
                 core_attn_out = checkpointViranceAttention(
                     custom_forward_before_attention,
                     self.core_attention,
                     q_compressed,
                     kv_combined,
+                    attention_mask,
                     distribute_saved_activations=self.config.distribute_saved_activations,
                     get_rng_state_tracker=tensor_parallel.random.get_cuda_rng_tracker,
                     tp_group=parallel_state.get_tensor_model_parallel_group(),
                 )      
             else:
-                core_attn_out =  checkpoint(
+                core_attn_out = checkpoint(
                     custom_forward_self_attention,
                     q_compressed,
                     kv_combined,
+                    attention_mask,
                     distribute_saved_activations=self.config.distribute_saved_activations,
                     get_rng_state_tracker=tensor_parallel.random.get_cuda_rng_tracker,
                     tp_group=parallel_state.get_tensor_model_parallel_group(),
                 )    
         else:
-            if self.config.recompute_variance == True:
+            if self.config.recompute_variance:
                 core_attn_out = tensor_parallel.checkpointViranceAttention(
-                    custom_forward_before_attention, self.core_attention, False, q_compressed, kv_combined)
+                    custom_forward_before_attention, self.core_attention, False, q_compressed, kv_combined, attention_mask)
             else:
                 core_attn_out = tensor_parallel.checkpoint(
-                    custom_forward_self_attention, False, q_compressed, kv_combined)
+                    custom_forward_self_attention, False, q_compressed, kv_combined, attention_mask)
     else:
-        core_attn_out = custom_forward_self_attention(q_compressed, kv_combined)
-    if packed_seq_params is not None:
+        core_attn_out = custom_forward_self_attention(q_compressed, kv_combined, attention_mask)
+    if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
         # reshape to same output shape as unpacked case
         # (t, np, hn) -> (t, b=1, h=np*hn)
         # t is the pack size = sum (sq_i)
@@ -291,7 +359,5 @@ def MLASelfAttention_forward(
     return output, bias
 # HACK(huang.huang)
 
-
 from transformer_engine.musa.pytorch.utils import replace_attr
-
 replace_attr(MLASelfAttention, "forward", MLASelfAttention_forward)

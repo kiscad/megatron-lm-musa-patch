@@ -1,68 +1,79 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from functools import partial, wraps
+from functools import partial
+from typing import Optional, Callable
 
 import torch
 import torch.nn.functional as F
 from torch.nn import Identity
 
 from megatron.core import tensor_parallel, parallel_state
-from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
-from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
-from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 
 from transformer_engine.pytorch.distributed import checkpoint, checkpointVirance
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
-from megatron.core.extensions.transformer_engine import te_checkpoint
+from megatron.core.transformer.moe.moe_utils import apply_random_logits
+
+try:
+    from transformer_engine.pytorch.cpu_offload import LaunchReloadFunction, get_fine_grained_offload_handler
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 # HACK(huang.huang): recompute/variance for experts in moe with fp8/bf16: 
 # support mlp_rms_recompute which combine rms, sharedEXP and gating into one checkpoint;
-def MoELayer_forward(self, hidden_states: torch.Tensor, norm_func=None):
-    """
-    Perform the forward pass through the MLP block.
+def MoELayer_forward(self: "MoELayer", hidden_states: torch.Tensor, norm_func: Optional[Callable] = None):
+    """Forward pass for the MoE layer.
+
+    The forward pass comprises four main steps:
+    1. Routing & Preprocessing: Route tokens to the assigned experts and prepare for dispatch.
+    2. Dispatch: Tokens are sent to the expert devices using communication collectives.
+    3. Expert Computation: Experts process the dispatched tokens.
+    4. Combine: The outputs from the experts are combined and returned.
+
     Args:
     hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
         b is batch size, and h is hidden size.
     norm_func (function): whether to do layernorm inner MLP instead of transformerlayer.
+    Returns:
+        A tuple containing the output tensor and the MLP bias, if any.
     """
-    if (
-        self.training
-        and self.config.tensor_model_parallel_size > 1
-        and not self.config.sequence_parallel
-    ):
+    if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
         raise ValueError(
             "During training, performance may degrade if MoE and tensor parallelism"
             "are enabled without also enabling sequence parallelism."
         )
 
-    
     # process MoE
     def custom_forward(hidden_states):
-
-        residual = hidden_states
-        
         if norm_func is not None:
             assert self.config.mlp_rms_recompute
+
+            def get_logits(input: torch.Tensor):
+                self.router._maintain_float32_expert_bias()
+                input = self.router.apply_input_jitter(input)
+                logits = self.router.gating(input)
+                if self.router.config.moe_router_force_load_balancing:
+                    logits = apply_random_logits(logits)
+                return logits
             
             def rms_recompute_func(hidden_states):
                 #combination of rms, sharedEXP and gating
-                hidden_states= norm_func(hidden_states)
-                logits = self.router.apply_input_jitter(hidden_states)
-                logits = self.router.gating(logits)
+                hidden_states = norm_func(hidden_states) 
+                logits = get_logits(hidden_states)
                 shared_output = self.shared_experts(hidden_states, no_recompute=True)
                 return hidden_states, logits, shared_output
             
             if self.config.fp8:
-                if self.config.recompute_variance:
-                    func_before_routing = lambda x : self.router.gating(self.router.apply_input_jitter(x))
+                if self.config.recompute_variance: 
                     linears = (Identity(), Identity(), self.shared_experts.linear_fc2)
-                    mid_function = (Identity(), func_before_routing, self.shared_experts.custom_func_first)
+                    mid_function = (Identity(), get_logits, self.shared_experts.custom_func_first) 
                     hidden_states, logits, shared_output = checkpointVirance(
                         norm_func, 
                         linears,
                         hidden_states,
                         distribute_saved_activations=self.config.distribute_saved_activations,
-                        get_rng_state_tracker=tensor_parallel.random.get_cuda_rng_tracker,
+                        get_rng_state_tracker=tensor_parallel.random.get_cuda_rng_tracker, 
                         tp_group=parallel_state.get_tensor_model_parallel_group(),
                         mid_function=mid_function
                     )
@@ -72,14 +83,13 @@ def MoELayer_forward(self, hidden_states: torch.Tensor, norm_func=None):
                         hidden_states,
                         distribute_saved_activations=self.config.distribute_saved_activations,
                         get_rng_state_tracker=tensor_parallel.random.get_cuda_rng_tracker,
-                        tp_group=parallel_state.get_tensor_model_parallel_group(),
+                        tp_group=parallel_state.get_tensor_model_parallel_group(), 
                     )
             else:
                 if self.config.recompute_variance:
-                    func_before_routing = lambda x : self.router.gating(self.router.apply_input_jitter(x))
                     linears = (Identity(), Identity(), self.shared_experts.linear_fc2)
-                    mid_function = (Identity(), func_before_routing, self.shared_experts.custom_func_first)
-                    hidden_states, logits, shared_output = tensor_parallel.checkpointVirance(
+                    mid_function = (Identity(), get_logits, self.shared_experts.custom_func_first)
+                    hidden_states, logits, shared_output = tensor_parallel.checkpointVirance( 
                         norm_func, 
                         linears,
                         False, 
@@ -88,71 +98,104 @@ def MoELayer_forward(self, hidden_states: torch.Tensor, norm_func=None):
                         )
                 else:
                     hidden_states, logits, shared_output = tensor_parallel.checkpoint(
-                        rms_recompute_func, False, hidden_states)
+                        rms_recompute_func, False, hidden_states)  
             probs, routing_map = self.router.routing(logits)
+            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(hidden_states, routing_map, probs)
         else:
-            probs, routing_map = self.router(hidden_states)
+            hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
 
-        hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs
-        )
         dispatched_input, probs = self.dispatch(hidden_states, probs)
-
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(dispatched_input, probs)
         )
+        custom_expert_forward = partial(self.experts, tokens_per_expert=tokens_per_expert)
+   
+        def _custom_func_first(permuted_local_hidden_states, permuted_probs, tokens_per_expert):
+            """Forward of TEGroupedMLP
 
-        custom_expert_forward = partial(self.experts, dispatched_input=dispatched_input, tokens_per_expert=tokens_per_expert, permuted_probs=permuted_probs)
+            Args:
+                permuted_local_hidden_states (torch.Tensor): The permuted input hidden states of the
+                local experts.
+                tokens_per_expert (torch.Tensor): The number of tokens per expert.
+                permuted_probs (torch.Tensor): The permuted probs of each token produced by the router.
 
-        def _custom_func_first(permuted_local_hidden_states, tokens_per_expert):
+            Return:
+                output (torch.Tensor): The output of the local experts.
+            """            
             #forward for linear1 and act in self.experts
             tokens_per_expert = tokens_per_expert.tolist()
+
+            if self.experts.config.fp8 and not self.experts.config.moe_router_padding_for_fp8:
+                actual_tokens_per_expert = tokens_per_expert
+                permuted_local_hidden_states, tokens_per_expert = self.experts.fp8_padding(
+                    permuted_local_hidden_states, tokens_per_expert
+                )
+                permuted_probs, _ = self.experts.fp8_padding(
+                    permuted_probs.unsqueeze(-1), actual_tokens_per_expert
+                )
+            else:
+                permuted_probs = permuted_probs.unsqueeze(-1)
+
+            if self.experts.config.moe_apply_probs_on_input:
+                assert (
+                    self.experts.config.moe_router_topk == 1
+                ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+                original_dtype = permuted_local_hidden_states.dtype
+                permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
+                permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
+                # Probs already applied, so reset to 1.
+                permuted_probs = torch.ones_like(permuted_probs)
+
             intermediate_parallel, bias_parallel = self.experts.linear_fc1(
-                permuted_local_hidden_states, tokens_per_expert
+                    permuted_local_hidden_states, tokens_per_expert
             )
 
-            if self.experts.config.bias_activation_fusion:
-                if self.experts.activation_func == F.gelu:
-                    if self.experts.config.gated_linear_unit:
-                        intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
+            def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
+                if self.experts.config.bias_activation_fusion:
+                    if self.experts.activation_func == F.silu and self.experts.config.gated_linear_unit:
+                        # dtype is handled inside the fused kernel
+                        intermediate_parallel = weighted_bias_swiglu_impl(
+                            intermediate_parallel,
+                            bias_parallel,
+                            permuted_probs,
+                            self.experts.config.activation_func_fp8_input_store,
+                        )
                     else:
-                        assert self.experts.config.add_bias_linear is True
-                        intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-                elif self.experts.activation_func == F.silu and self.experts.config.gated_linear_unit:
-                    intermediate_parallel = bias_swiglu_impl(
-                        intermediate_parallel,
-                        bias_parallel,
-                        self.config.activation_func_fp8_input_store,
-                    )
+                        raise ValueError("Only support fusion of swiglu in TEGroupedMLP.")
                 else:
-                    raise ValueError("Only support fusion of gelu and swiglu")
-            else:
-                if bias_parallel is not None:
-                    shape = intermediate_parallel.shape
-                    intermediate_parallel = torch.cat(
-                        [
-                            t + b
-                            for t, b in zip(
-                                torch.split(
-                                    intermediate_parallel.view(-1, shape[-1]), tokens_per_expert
-                                ),
-                                bias_parallel,
-                            )
-                        ]
-                    ).view(shape)
-                if self.experts.config.gated_linear_unit:
+                    if bias_parallel is not None:
+                        shape = intermediate_parallel.shape
+                        intermediate_parallel = torch.cat(
+                            [
+                                t + b
+                                for t, b in zip(
+                                    torch.split(
+                                        intermediate_parallel.view(-1, shape[-1]), tokens_per_expert
+                                    ),
+                                    bias_parallel,
+                                )
+                            ]
+                        ).view(shape)
+                    if self.experts.config.gated_linear_unit:
 
-                    def glu(x):
-                        x = torch.chunk(x, 2, dim=-1)
-                        return self.experts.config.activation_func(x[0]) * x[1]
+                        def glu(x):
+                            x = torch.chunk(x, 2, dim=-1)
+                            return self.experts.config.activation_func(x[0]) * x[1]
 
-                    intermediate_parallel = glu(intermediate_parallel)
-                else:
-                    intermediate_parallel = self.experts.activation_func(intermediate_parallel)
-            return intermediate_parallel, tokens_per_expert
+                        intermediate_parallel = glu(intermediate_parallel)
+                    else:
+                        intermediate_parallel = self.experts.activation_func(intermediate_parallel)
+                    original_dtype = intermediate_parallel.dtype
+                    intermediate_parallel = intermediate_parallel * permuted_probs
+                    intermediate_parallel = intermediate_parallel.to(original_dtype)
+                return intermediate_parallel
+            
+            intermediate_parallel = bias_act_func(
+                    intermediate_parallel, bias_parallel, permuted_probs
+            )
+            return intermediate_parallel, tokens_per_expert        
 
         custom_func_first = partial(_custom_func_first, tokens_per_expert=tokens_per_expert)
-
 
         if self.config.mlp_recompute:
             if self.config.fp8:
@@ -161,6 +204,8 @@ def MoELayer_forward(self, hidden_states: torch.Tensor, norm_func=None):
                         custom_func_first,
                         self.experts.linear_fc2,
                         dispatched_input,
+                        permuted_probs,
+                        fine_grained_offload=self.config.offload_moe_fc1_input,
                         distribute_saved_activations=self.config.distribute_saved_activations,
                         get_rng_state_tracker=tensor_parallel.random.get_cuda_rng_tracker,
                         tp_group=parallel_state.get_tensor_model_parallel_group(),
@@ -169,6 +214,7 @@ def MoELayer_forward(self, hidden_states: torch.Tensor, norm_func=None):
                     expert_output, mlp_bias = checkpoint(
                         custom_expert_forward, 
                         dispatched_input,
+                        permuted_probs,
                         distribute_saved_activations=self.config.distribute_saved_activations,
                         get_rng_state_tracker=tensor_parallel.random.get_cuda_rng_tracker,
                         tp_group=parallel_state.get_tensor_model_parallel_group(),
@@ -176,52 +222,48 @@ def MoELayer_forward(self, hidden_states: torch.Tensor, norm_func=None):
             else:
                 if self.config.recompute_variance:
                     expert_output, mlp_bias = tensor_parallel.checkpointVirance(
-                        custom_func_first, self.experts.linear_fc2, False, dispatched_input)
+                        custom_func_first, 
+                        self.experts.linear_fc2, 
+                        False, dispatched_input, 
+                        permuted_probs, 
+                        fine_grained_offload=self.config.offload_moe_fc1_input)
                 else:
                     expert_output, mlp_bias = tensor_parallel.checkpoint(
-                        custom_expert_forward, False, dispatched_input)
+                        custom_expert_forward, False, dispatched_input, permuted_probs)
+            
+                    
+            if self.experts.config.fp8 and not self.experts.config.moe_router_padding_for_fp8:
+                expert_output = self.experts.fp8_unpadding(expert_output, tokens_per_expert.tolist())
+            if self.config.offload_moe_fc1_input: 
+                # LaunchReloadFunction after experts.forward, same as expert.py 
+                assert self.config.recompute_variance, "mlp_recompute with offload only support recompute_variant only"
+                expert_output = LaunchReloadFunction.apply(expert_output, 'fc1_inp')
         else:
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
-
-        # output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
+        
+        assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
         output = self.token_dispatcher.token_combine(output)
         output = self.token_dispatcher.combine_postprocess(output)
-
+        
         if norm_func is not None:
             #self.shared_experts called in the begining of custom_forward, which is convenient for rms recmopute 
-            output = output + shared_output
+            output = output + shared_output  
         elif self.use_shared_expert and not self.shared_expert_overlap:
             # if shared_expert_overlap is True, the expert calculation happens in
             # the token_dispatcher to overlap communications and computations
             output = output + self.shared_experts(residual)
+
+        if self.config.offload_moe_fc1_input:
+            get_fine_grained_offload_handler().launch_offload('fc1_inp')
         return output, mlp_bias
-
-    if self.moe_layer_recompute:
-        output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
-    else:
-        output, mlp_bias = custom_forward(hidden_states)
-
-    # if self.moe_layer_recompute:
-    #     if self.config.fp8:
-    #         output, mlp_bias = te_checkpoint(
-    #             custom_forward,
-    #             False,
-    #             tensor_parallel.random.get_cuda_rng_tracker,
-    #             parallel_state.get_tensor_model_parallel_group(),
-    #             hidden_states,
-    #         )
-    #     else:
-    #         output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
-    # else:
-    #     output, mlp_bias = custom_forward(hidden_states)
-
+    
+    output, mlp_bias = custom_forward(hidden_states)
     return output, mlp_bias
 ## HACK(huang.huang)
 
-
 # HACK(huang.huang): recompute/variance for SharedExpertMLP, avoid repeated recomputation between moe-layer and sharedExp  
-def SharedExpertMLP_forward(self, hidden_states, no_recompute=False):
+def SharedExpertMLP_forward(self: "SharedExpertMLP", hidden_states: torch.Tensor, no_recompute: bool = False):
     """ 
     Perform the forward pass through the SharedExpertMLP block.
     Args:

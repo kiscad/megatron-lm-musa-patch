@@ -1,13 +1,22 @@
+import torch
+
 from megatron.core.utils import make_viewless_tensor
 from megatron.core import parallel_state, tensor_parallel
 
 from transformer_engine.pytorch.distributed import checkpoint, checkpointVirance
 
+from megatron.core.utils import (
+    deprecate_inference_params,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
+
 # HACK(huang.huang): support mlp_rms_recompute and mla_rms_recompute, 
 # which need to decide to do layernorm in TransformerLayer or inner mlp/mla
 def TransformerLayer_forward(
-    self,
-    hidden_states,
+    self: "TransformerLayer",
+    hidden_states: torch.Tensor,
     attention_mask=None,
     context=None,
     context_mask=None,
@@ -18,6 +27,8 @@ def TransformerLayer_forward(
     inference_context=None,
     packed_seq_params=None,
     sequence_len_offset=None,
+    *,
+    inference_params=None,
 ):
     """
     Perform a forward pass through the transformer layer.
@@ -35,6 +46,7 @@ def TransformerLayer_forward(
         attention_bias (Tensor, optional): Bias tensor for Q * K.T.
         inference_context (object, optional): Parameters for inference-time optimizations.
         packed_seq_params (object, optional): Parameters for packed sequence processing.
+        sequence_len_offset (Tensor, optional): Offset along sequence dimension during inference.
 
     Returns:
         Tuple[Tensor, Tensor]: A tuple containing:
@@ -42,6 +54,7 @@ def TransformerLayer_forward(
             context (Tensor): Updated context tensor if cross-attention is used,
             otherwise None.
     """
+    inference_context = deprecate_inference_params(inference_context, inference_params)
 
     # Residual connection.
     residual = hidden_states
@@ -50,6 +63,7 @@ def TransformerLayer_forward(
     #HACK(huang.haung): support mla_rms_recompute
     if self.config.mla_rms_recompute:
         assert self.config.attn_recompute, 'mla_rms_recompute only use with attn_recompute now.'
+
         def rms_with_down_proj(hidden_states):
             hidden_states = self.input_layernorm(hidden_states)
             if self.self_attention.config.q_lora_rank is not None:
@@ -58,9 +72,10 @@ def TransformerLayer_forward(
                 q_compressed = hidden_states      
             kv_combined, _ = self.self_attention.linear_kv_down_proj(hidden_states)
             return q_compressed, kv_combined
-        input_layernorm_output = None
+        
+        # input_layernorm_output = None
         if self.config.fp8:
-            if self.config.recompute_variance == True:
+            if self.config.recompute_variance:
                 linears = (self.self_attention.linear_q_down_proj, self.self_attention.linear_kv_down_proj)
                 q_compressed, kv_combined = checkpointVirance(
                     self.input_layernorm, 
@@ -86,13 +101,16 @@ def TransformerLayer_forward(
                     self.input_layernorm, 
                     linears,
                     False, 
-                    hidden_states)
+                    hidden_states
+                )
             else:
                 q_compressed, kv_combined =  tensor_parallel.checkpoint(
                     rms_with_down_proj, False, hidden_states)
 
+        # Self attention.
+        nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
+            hidden_states=None,
             attention_mask=attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
@@ -101,15 +119,18 @@ def TransformerLayer_forward(
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+
             q_compressed=q_compressed,
             kv_combined=kv_combined,
         )
+        nvtx_range_pop(suffix="self_attention")
 
     else: #maintain original implement, to support non MLA attention
         input_layernorm_output = self.input_layernorm(hidden_states)
         # Self attention.
+        nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
-            input_layernorm_output,
+            hidden_states=input_layernorm_output,
             attention_mask=attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
@@ -118,15 +139,18 @@ def TransformerLayer_forward(
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-        )       
+        )      
+        nvtx_range_pop(suffix="self_attention") 
     ## HACK(huang.haung)
 
     # TODO: could we move `bias_dropout_add_exec_handler` itself
     # inside the module provided in the `bias_dropout_add_spec` module?
+    nvtx_range_push(suffix="self_attn_bda")
     with self.bias_dropout_add_exec_handler():
         hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
             attention_output_with_bias, residual, self.hidden_dropout
         )
+    nvtx_range_pop(suffix="self_attn_bda")
 
     # Residual connection.
     residual = hidden_states
@@ -155,22 +179,47 @@ def TransformerLayer_forward(
     # Residual connection.
     residual = hidden_states
 
+    pre_mlp_layernorm_output = None
+    should_chunk_mlp_for_prefill = (
+        self.config.mlp_chunks_for_prefill > 1
+        and inference_context is not None
+        and not inference_context.is_decode_only()
+        and not isinstance(self.mlp, IdentityOp)
+    )
+
     # Optional Layer norm post the cross-attention.
     #HACK(huang.haung): support mlp_rms_recompute
     if self.config.mlp_rms_recompute:
-        pre_mlp_layernorm_output = None
-        mlp_output_with_bias = self.mlp(hidden_states, self.pre_mlp_layernorm)
+        mlp_output_with_bias = self.mlp(hidden_states, norm_func=self.pre_mlp_layernorm)
+
+    elif should_chunk_mlp_for_prefill:
+        # Chunk input along sequence dimension
+        num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
+        chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
+
+        # Compute outputs for each chunk
+        outputs = [self.mlp(chunk) for chunk in chunks]
+
+        # Aggregate chunk outputs
+        mlp_output = torch.cat([out for out, _ in outputs], dim=0)
+        bias_chunks = [bias for _, bias in outputs if bias is not None]
+        bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
+        mlp_output_with_bias = (mlp_output, bias_output)
+    
     else:
         pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
         mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
     ## HACK(huang.haung)
+
     # TODO: could we move `bias_dropout_add_exec_handler` itself
     # inside the module provided in the `bias_dropout_add_spec` module?
+    nvtx_range_push(suffix="mlp_bda")
     with self.bias_dropout_add_exec_handler():
         hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
             mlp_output_with_bias, residual, self.hidden_dropout
         )
-
+    nvtx_range_pop(suffix="mlp_bda")
+    
     # Jit compiled function creates 'view' tensor. This tensor
     # potentially gets saved in the MPU checkpoint function context,
     # which rejects view tensors. While making a viewless tensor here

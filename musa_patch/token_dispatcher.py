@@ -671,8 +671,6 @@ def MoEAlltoAllTokenDispatcher_combine_postprocess(self, permutated_local_input_
         permutated_local_input_tokens,
         self.reversed_local_input_permutation_mapping,
         restore_shape=self.hidden_shape_before_permute,
-        # Probs already applied, so reset to 1.
-        probs=torch.ones_like(self.probs),
         routing_map=self.routing_map,
         fused=self.config.moe_permute_fusion,
         drop_and_pad=self.drop_and_pad,

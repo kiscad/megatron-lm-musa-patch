@@ -7,11 +7,14 @@
 # import logging
 
 import torch
+from typing import Optional, Callable
 # from torch import _C
 from torch.cuda import _lazy_call
 from torch.nn import Identity
 # from torch.cuda import device as device_ctx_manager
 from torch.utils.checkpoint import detach_variable
+
+from transformer_engine.pytorch.cpu_offload import set_offloading_param, get_fine_grained_offload_handler
 
 # from megatron.core.parallel_state import (
 #     get_expert_model_parallel_rank,
@@ -25,7 +28,6 @@ from megatron.core.tensor_parallel.utils import gather_split_1d_tensor, split_te
 
 from megatron.core.tensor_parallel.random import (CheckpointFunction, get_cuda_rng_tracker,
                                                    _set_cuda_rng_state)
-
     
 # HACK(huang.huang): recompute-variance for [somefunc+fa] and [somefunc+linear], 
 # which can save a forward for fa/linear when backward recompute 
@@ -52,7 +54,8 @@ class CheckpointFunctionVirance(CheckpointFunction):
 
     # pylint: disable=missing-function-docstring
     @staticmethod
-    def forward(ctx, run_function, last_function, mid_function, distribute_saved_activations, *args):
+    def forward(ctx, run_function: Callable, last_function: Callable, mid_function: Optional[Callable], 
+                distribute_saved_activations, fine_grained_offload: bool, *args):
         """Forward pass."""
         if not isinstance(last_function, tuple):
             last_function = (last_function, )
@@ -98,10 +101,21 @@ class CheckpointFunctionVirance(CheckpointFunction):
                 args[0], split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
             )
 
+
         # Store everything.
         ctx.inputs = [arg if not torch.is_tensor(arg) else None for arg in args]
         tensor_inputs = [arg if torch.is_tensor(arg) else None for arg in args]
-        ctx.save_for_backward(*tensor_inputs)
+        fine_grained_offload_handler = get_fine_grained_offload_handler()
+        if fine_grained_offload and not fine_grained_offload_handler.is_last_layer():
+            assert len(tensor_inputs) == 2 # [input, prob]
+            fc1_input = tensor_inputs[0]
+            set_offloading_param(fc1_input, 'fine_grained_offloading', 'fc1_inp')
+            ctx.tensor_tags = fine_grained_offload_handler.register_offload(fc1_input)
+            ctx.save_for_backward(*tensor_inputs[1:])
+
+        else: 
+            ctx.tensor_tags = None
+            ctx.save_for_backward(*tensor_inputs)
 
         return total_outputs
 
@@ -115,9 +129,19 @@ class CheckpointFunctionVirance(CheckpointFunction):
                 "please use .backward() if possible"
             )
         # inputs = ctx.saved_tensors
-        inputs = tuple(
-            t if t is not None else arg for (t, arg) in zip(ctx.saved_tensors, ctx.inputs)
-        )
+        if ctx.tensor_tags is None:
+            inputs = tuple(
+                t if t is not None else arg for (t, arg) in zip(ctx.saved_tensors, ctx.inputs)
+            )
+        else:
+            fine_grained_offload_handler = get_fine_grained_offload_handler()
+            assert not fine_grained_offload_handler.is_last_layer()
+            fc1_input = fine_grained_offload_handler.wait_reload(ctx.tensor_tags)
+            fc1_input.requires_grad = True #need grad when reload a detached cpu tensor
+            inputs = tuple(
+                t if t is not None else arg for (t, arg) in zip((fc1_input, *ctx.saved_tensors), ctx.inputs)
+            )
+
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
                 inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
@@ -139,7 +163,7 @@ class CheckpointFunctionVirance(CheckpointFunction):
             outputs = ctx.run_function(*detached_inputs)
             outputs = outputs if isinstance(outputs, tuple) else (outputs, )
             total_outputs = []
-            for i,func in enumerate(ctx.mid_function):
+            for i, func in enumerate(ctx.mid_function):
                 outputs_f = func(*outputs)
                 if isinstance(outputs_f, torch.Tensor):
                     outputs_f = [outputs_f,]
@@ -175,12 +199,13 @@ class CheckpointFunctionVirance(CheckpointFunction):
             total_args_with_grad += args_with_grad
         torch.autograd.backward(total_outputs_with_grad, total_args_with_grad)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
-        return (None, None, None, None) + grads
+        return (None, None, None, None, None) + grads
     
-def checkpointVirance(run_function, last_function, distribute_saved_activations, *args, mid_function=None):
+def checkpointVirance(run_function: Callable, last_function: Callable, distribute_saved_activations, 
+                      *args, mid_function: Optional[Callable] = None, fine_grained_offload: bool = False):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
-    return CheckpointFunctionVirance.apply(run_function, last_function, mid_function, distribute_saved_activations, *args)
+    return CheckpointFunctionVirance.apply(run_function, last_function, mid_function, distribute_saved_activations, fine_grained_offload, *args)
 
 
 

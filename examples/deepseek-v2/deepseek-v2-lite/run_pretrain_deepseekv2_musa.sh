@@ -143,6 +143,7 @@ TRAINING_ARGS=(
     # --use-precision-aware-optimizer # cpu offload must be precision-aware
     # --overlap-cpu-optimizer-d2h-h2d
     --tp-only-amax-red
+    --enable-experimental    # 新版本Megatron打开，旧版本Megatron关掉此项
 )
 
 MLA_ARGS=(

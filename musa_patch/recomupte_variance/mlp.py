@@ -1,52 +1,85 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import torch
+from typing import Optional, Callable
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel, parallel_state
 
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
-from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+
+from megatron.core.utils import (
+    nvtx_range_pop,
+    nvtx_range_push,
+)
+
+try:
+    import transformer_engine  # pylint: disable=unused-import
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 from transformer_engine.pytorch.distributed import checkpoint, checkpointVirance
 # HACK(huang.huang): recompute/variance for mlp in moe with fp8/bf16: 
 # support mlp_rms_recompute,  which combine rms, mlp into one checkpoint;
 # add new arg "no_recompute" to avoid repated recompute for sharedEXP while 
 # moe_layer is already recomputed outsides
-def MLP_forward(self, hidden_states, norm_func=None, no_recompute=False):
+def MLP_forward(self: "MLP", hidden_states: torch.Tensor, norm_func: Optional[Callable] = None, 
+                per_token_scale: Optional[torch.Tensor] = None, no_recompute: bool = False):
     """
     Perform the forward pass through the MLP block.
     Args:
     hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
         b is batch size, and h is hidden size.
     norm_func (function): whether to do layernorm inner MLP instead of transformerlayer.
+    per_token_scale(Tensor): Used to rescale hidden states on a per-token basis (e.g., 
+        for adaptive weighting or gating).
     no_recompute (bool): default is False. only set to True when is sharedEXP, 
                         to avoid repeated recomputation between this mlp and moe_layer 
     """
     # [s, b, 4 * h/p]
-    def custom_forward(hidden_states):
+    def custom_forward(hidden_states, per_token_scale):
         if norm_func is not None:
             assert self.config.mlp_rms_recompute
-            
-            hidden_states= norm_func(hidden_states)
-        intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+            hidden_states = norm_func(hidden_states)
 
+        nvtx_range_push(suffix="linear_fc1")
+        intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+        nvtx_range_pop(suffix="linear_fc1")
+
+        nvtx_range_push(suffix="activation")
         if self.config.bias_activation_fusion:
-            if self.activation_func == F.gelu:
-                if self.config.gated_linear_unit:
-                    intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
+            if per_token_scale is not None:
+                if self.activation_func == F.silu and self.config.gated_linear_unit:
+                    # dtype is handled inside the fused kernel
+                    intermediate_parallel = weighted_bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        per_token_scale.unsqueeze(-1),
+                        self.config.activation_func_fp8_input_store,
+                    )
                 else:
-                    assert self.config.add_bias_linear is True
-                    intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-            elif self.activation_func == F.silu and self.config.gated_linear_unit:
-                intermediate_parallel = bias_swiglu_impl(
-                    intermediate_parallel,
-                    bias_parallel,
-                    self.config.activation_func_fp8_input_store,
-                )
-            else:
-                raise ValueError("Only support fusion of gelu and swiglu")
+                    raise ValueError("Only support fusion of swiglu with per_token_scale in MLP.")
+            else: 
+                if self.activation_func == F.gelu:
+                    if self.config.gated_linear_unit:
+                        intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
+                    else:
+                        assert self.config.add_bias_linear is True
+                        intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                elif self.activation_func == F.silu and self.config.gated_linear_unit:
+                    intermediate_parallel = bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        self.config.activation_func_fp8_input_store,
+                        self.config.cpu_offloading
+                        and self.config.cpu_offloading_activations
+                        and HAVE_TE,
+                    )
+                else:
+                    raise ValueError("Only support fusion of gelu and swiglu")
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
@@ -60,16 +93,28 @@ def MLP_forward(self, hidden_states, norm_func=None, no_recompute=False):
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
+            if per_token_scale is not None:
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
+        nvtx_range_pop(suffix="activation")
+
         # [s, b, h]
+        nvtx_range_push(suffix="linear_fc2")
         output, output_bias = self.linear_fc2(intermediate_parallel)
+        nvtx_range_pop(suffix="linear_fc2")
+
+        if per_token_scale is not None:
+            assert output_bias is None, "Bias is not supported with per_token_scale"
+
         return output, output_bias
     
     if norm_func is not None:
-        _custom_func_first = lambda x : self.custom_func_first(norm_func(x))
+        _custom_func_first = lambda input, per_token_scale : self.custom_func_first(norm_func(input), per_token_scale)
     else:
-        _custom_func_first = lambda x : self.custom_func_first(x)# use lambda to create new func instead of method object which can't add new attribute
+        _custom_func_first = lambda input, per_token_scale : self.custom_func_first(input, per_token_scale)# use lambda to create new func instead of method object which can't add new attribute
     if no_recompute: #avoid to recompute under another recompute context outside this function, like in sharedExp
-        return custom_forward(hidden_states)
+        return custom_forward(hidden_states, per_token_scale)
     
     if self.config.mlp_recompute:
         if self.config.fp8:
@@ -78,6 +123,7 @@ def MLP_forward(self, hidden_states, norm_func=None, no_recompute=False):
                     _custom_func_first,
                     self.linear_fc2,
                     hidden_states,
+                    per_token_scale,
                     distribute_saved_activations=self.config.distribute_saved_activations,
                     get_rng_state_tracker=tensor_parallel.random.get_cuda_rng_tracker,
                     tp_group=parallel_state.get_tensor_model_parallel_group(),
@@ -86,42 +132,62 @@ def MLP_forward(self, hidden_states, norm_func=None, no_recompute=False):
                 output, output_bias = checkpoint(
                     custom_forward, 
                     hidden_states,
-                    distribute_saved_activations=self.config.distribute_saved_activations,
-                    get_rng_state_tracker=tensor_parallel.random.get_cuda_rng_tracker,
+                    per_token_scale, 
+                    distribute_saved_activations=self.config.distribute_saved_activations, 
+                    get_rng_state_tracker=tensor_parallel.random.get_cuda_rng_tracker, 
                     tp_group=parallel_state.get_tensor_model_parallel_group(),
-                    )
+                    ) 
         else:
             if self.config.recompute_variance:
                 output, output_bias = tensor_parallel.checkpointVirance(
-                    _custom_func_first, self.linear_fc2, False, hidden_states)
+                    _custom_func_first, self.linear_fc2, False, hidden_states, per_token_scale)
             else:
-                output, output_bias = tensor_parallel.checkpoint(
-                    custom_forward, False, hidden_states)
+                output, output_bias = tensor_parallel.checkpoint( 
+                    custom_forward, False, hidden_states, per_token_scale)
     else:
-        output, output_bias = custom_forward(hidden_states)
+        output, output_bias = custom_forward(hidden_states, per_token_scale)
+
     return output, output_bias
 ## HACK(huang.huang)
 
 # HACK(huang.huang): seperate linear1 and act from mlp, to support potential recoumpute variance,
 # which need a separated linear2
-def MLP_custom_func_first(self, hidden_states):
+def MLP_custom_func_first(self: "MLP", hidden_states, per_token_scale=None):
+    nvtx_range_push(suffix="linear_fc1")
     intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+    nvtx_range_pop(suffix="linear_fc1")
 
+    nvtx_range_push(suffix="activation")
     if self.config.bias_activation_fusion:
-        if self.activation_func == F.gelu:
-            if self.config.gated_linear_unit:
-                intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
+        if per_token_scale is not None:
+            if self.activation_func == F.silu and self.config.gated_linear_unit:
+                # dtype is handled inside the fused kernel
+                intermediate_parallel = weighted_bias_swiglu_impl(
+                    intermediate_parallel,
+                    bias_parallel,
+                    per_token_scale.unsqueeze(-1),
+                    self.config.activation_func_fp8_input_store,
+                )
             else:
-                assert self.config.add_bias_linear is True
-                intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-        elif self.activation_func == F.silu and self.config.gated_linear_unit:
-            intermediate_parallel = bias_swiglu_impl(
-                intermediate_parallel,
-                bias_parallel,
-                self.config.activation_func_fp8_input_store,
-            )
-        else:
-            raise ValueError("Only support fusion of gelu and swiglu")
+                raise ValueError("Only support fusion of swiglu with per_token_scale in MLP.")
+        else: 
+            if self.activation_func == F.gelu:
+                if self.config.gated_linear_unit:
+                    intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
+                else:
+                    assert self.config.add_bias_linear is True
+                    intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+            elif self.activation_func == F.silu and self.config.gated_linear_unit:
+                intermediate_parallel = bias_swiglu_impl(
+                    intermediate_parallel,
+                    bias_parallel,
+                    self.config.activation_func_fp8_input_store,
+                    self.config.cpu_offloading
+                    and self.config.cpu_offloading_activations
+                    and HAVE_TE,
+                )
+            else:
+                raise ValueError("Only support fusion of gelu and swiglu")
     else:
         if bias_parallel is not None:
             intermediate_parallel = intermediate_parallel + bias_parallel
@@ -134,6 +200,12 @@ def MLP_custom_func_first(self, hidden_states):
             intermediate_parallel = glu(intermediate_parallel)
         else:
             intermediate_parallel = self.activation_func(intermediate_parallel)
+
+        if per_token_scale is not None:
+            original_dtype = intermediate_parallel.dtype
+            intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+            intermediate_parallel = intermediate_parallel.to(original_dtype)
+    nvtx_range_pop(suffix="activation")
     
     return intermediate_parallel
 ## HACK(huang.huang)
