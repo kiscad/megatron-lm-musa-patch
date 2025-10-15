@@ -46,19 +46,19 @@ class MoEMonitor():
         self.router_logit_var_mointor_freq = int(os.getenv('ROUTER_LOGIT_VAR_MONITOR_FREQ', 0))
         self.router_maxvio_mointor_freq = int(os.getenv('ROUTER_MAXVIO_MONITOR_FREQ', 0))
 
-        if self.router_prob_var_mointor_freq != 0:
+        if self.router_prob_var_mointor_freq > 0:
             self.prob_var_mointor = MoERouterProbVarianceMonitor(model, global_iteration=iteration, log_every=self.router_prob_var_mointor_freq)
-        if self.router_logit_var_mointor_freq != 0:
+        if self.router_logit_var_mointor_freq > 0:
             self.logit_var_mointor = MoEGatingLogitVarianceMonitor(model, global_iteration=iteration, log_every=self.router_logit_var_mointor_freq)
-        if self.router_maxvio_mointor_freq != 0:
+        if self.router_maxvio_mointor_freq > 0:
             self.maxvio_mointor = MoELoadBalanceMaxVioMonitor(model, global_iteration=iteration, log_every=self.router_maxvio_mointor_freq)
     
     def step(self):
-        if self.router_prob_var_mointor_freq != 0:
+        if self.router_prob_var_mointor_freq > 0:
             self.prob_var_mointor.step()
-        if self.router_logit_var_mointor_freq != 0:
+        if self.router_logit_var_mointor_freq > 0:
             self.logit_var_mointor.step()
-        if self.router_maxvio_mointor_freq != 0:
+        if self.router_maxvio_mointor_freq > 0:
             self.maxvio_mointor.step()
         
 

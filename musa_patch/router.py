@@ -1,24 +1,176 @@
 """
 ================================== MoE Router相关算法 ====================================
 moe_router_norm_before_softmax: 
-    默认关闭
-    开启: MOE_ROUTER_NORM_BEFORE_SOFTMAX=1
-    可设置缩放系数 (默认为1): i.e., MOE_ROUTER_NORM_SCALE=2
+Routing Diversification:
 =========================================================================================
 """
 
 
 import os
+from typing import Callable, Optional
+from functools import partial
+from megatron.core.transformer.transformer_config import TransformerConfig
+
 import torch
 import torch.nn.functional as F
+
+from megatron.core.transformer.moe.moe_utils import (
+    ModelCommProcessGroups,
+    MoEAuxLossAutoScaler,
+    apply_random_logits,
+    save_to_aux_losses_tracker,
+    sequence_load_balancing_loss_func,
+    topk_softmax_with_capacity,
+)
+
 from megatron.core.transformer.moe.router import TopKRouter
+from transformer_engine.musa.pytorch.utils import replace_attr, add_attr
 
 
-moe_router_norm_before_softmax = int(os.getenv('MOE_ROUTER_NORM_BEFORE_SOFTMAX', 0)) == 1
-moe_router_norm_scale = float(os.getenv('MOE_ROUTER_NORM_SCALE', 1))
+def sequence_load_balancing_variance_func(
+    probs: torch.Tensor,
+    batch_size: int,
+    seq_length: int,
+    moe_aux_var_scale: float,
+    sequence_partition_group=None,
+):
+    if sequence_partition_group is not None:
+        raise NotImplementedError(
+            "sequence_load_balancing_variance_func doesn't support sequential parallelism yet"
+        )
+
+    x = probs.view(seq_length, batch_size, -1).to(torch.float32)
+    var_per_seq_exp = x.var(dim=0, unbiased=False)   # [B, E]
+    loss = -var_per_seq_exp.mean() * float(moe_aux_var_scale)
+    return loss
 
 
-def router_forward_with_normalization(self, input: torch.Tensor):
+def router_init_func(
+        self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = None
+    ) -> None:
+    """Initialize the zero token dropping router.
+
+    Args:
+        config (TransformerConfig): The configuration for the transformer model.
+        model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
+    """
+    super(TopKRouter, self).__init__(config=config, model_comm_pgs=model_comm_pgs)
+    self.topk = self.config.moe_router_topk
+    self.routing_type = self.config.moe_router_load_balancing_type
+    self.score_function = self.config.moe_router_score_function
+    self.input_jitter = None
+
+    self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+    if self.enable_expert_bias:
+        self.register_buffer(
+            'local_tokens_per_expert',
+            torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device()),
+            persistent=False,
+        )
+        self.register_buffer(
+            'expert_bias', torch.zeros(self.config.num_moe_experts, dtype=torch.float32, device=torch.cuda.current_device())
+        )
+    else:
+        self.local_tokens_per_expert = None
+        self.expert_bias = None
+
+    self.enable_moe_router_norm = float(os.getenv('ENABLE_MOE_ROUTER_NORM', 0))
+    self.enable_moe_aux_var_loss = float(os.getenv('ENABLE_MOE_AUX_VAR_LOSS', 0))
+
+    self.moe_router_norm_scale = float(os.getenv('MOE_ROUTER_NORM_SCALE', 1))
+    self.moe_aux_var_scale = float(os.getenv('MOE_AUX_VAR_SCALE', 10)) # should be the same as the seq-length?
+
+
+def seq_aux_loss_load_balancing(self, logits: torch.Tensor, bsz: int, seq_length: int):
+    """Apply sequence-auxiliary loss-based load balancing to the logits tensor.
+
+    Args:
+        logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
+        bsz (int): The batch size.
+        seq_length (int): The sequence length.
+
+    Returns:
+        probs (torch.Tensor): The probabilities of token to experts assignment.
+        routing_map (torch.Tensor): The mask of token to experts assignment.
+    """
+
+    probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
+        logits,
+        self.topk,
+        capacity_factor=self.config.moe_expert_capacity_factor,
+        pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+        drop_policy=self.config.moe_token_drop_policy,
+        use_pre_softmax=self.config.moe_router_pre_softmax,
+        num_groups=self.config.moe_router_num_groups,
+        group_topk=self.config.moe_router_group_topk,
+        scaling_factor=self.config.moe_router_topk_scaling_factor,
+        deterministic_mode=self.config.deterministic_mode,
+        score_function=self.score_function,
+        expert_bias=self.expert_bias,
+    )
+
+    if self.training and torch.is_grad_enabled():
+        # Apply sequence-auxiliary load balancing loss
+        scores, loss_routing_map = self.compute_routing_scores_for_aux_loss(logits)
+        aux_loss_func = partial(
+            sequence_load_balancing_loss_func,
+            probs=scores,
+            routing_map=loss_routing_map,
+            batch_size=bsz,
+            seq_length=seq_length,
+            topk=self.topk,
+        )
+        probs = self.apply_load_balancing_loss(
+            activation=probs, load_balancing_loss_func=aux_loss_func
+        )
+
+        var_loss_func = partial(
+            sequence_load_balancing_variance_func,
+                probs=scores,
+                batch_size=bsz,
+                seq_length=seq_length,
+        )
+        probs = self.apply_load_balancing_variance(
+            activation=probs, variance_loss_func=var_loss_func
+        )
+
+    return probs, routing_map
+
+
+def apply_load_balancing_variance(
+        self, activation: torch.Tensor, variance_loss_func: Callable
+    ):
+    if not (self.enable_moe_aux_var_loss and self.moe_aux_var_scale > 0.0):
+        return activation
+
+    sequence_partition_group = None
+    if self.tp_cp_group.size() > 1:
+        sequence_partition_group = self.tp_cp_group
+
+    variance_loss = variance_loss_func(
+        moe_aux_var_scale=self.moe_aux_var_scale, sequence_partition_group=sequence_partition_group,
+    )
+
+    num_layers = self.config.num_layers
+    if self.config.mtp_num_layers is not None:
+        num_layers += self.config.mtp_num_layers
+
+    save_to_aux_losses_tracker(
+        "load_balancing_variance",
+        variance_loss / self.moe_aux_var_scale,
+        self.layer_number,
+        num_layers,
+        reduce_group=sequence_partition_group,
+    )
+
+    if self.calculate_per_token_loss:
+        activation = MoEAuxLossAutoScaler.apply(activation, variance_loss * activation.shape[0])
+    else:
+        activation = MoEAuxLossAutoScaler.apply(activation, variance_loss)
+    return activation
+
+
+def forward(self, input: torch.Tensor):
     """
     Forward pass of the router.
 
@@ -32,12 +184,12 @@ def router_forward_with_normalization(self, input: torch.Tensor):
     logits = self.gating(input)
 
     # ---- Add normalization before softmax ----
-    if moe_router_norm_before_softmax:
+    if self.enable_moe_router_norm and self.moe_router_norm_scale > 0.:
         logits = F.layer_norm(
             logits, 
-            normalized_shape=(logits.size(-1),), 
+            normalized_shape=(logits.size(-1),),
             weight=None, bias=None)
-        logits.mul_(moe_router_norm_scale)
+        logits.mul_(self.moe_router_norm_scale)
     # ------------------------------------------
 
     if self.config.moe_router_force_load_balancing:
@@ -48,8 +200,7 @@ def router_forward_with_normalization(self, input: torch.Tensor):
     return scores, routing_map
 
 
-from transformer_engine.musa.pytorch.utils import replace_attr, add_attr
-if moe_router_norm_before_softmax and moe_router_norm_scale != 0.:
-    from megatron.core.transformer.moe.router import TopKRouter
-    replace_attr(TopKRouter, "forward", router_forward_with_normalization)
-
+add_attr(TopKRouter, "apply_load_balancing_variance", apply_load_balancing_variance)
+replace_attr(TopKRouter, "__init__", router_init_func)
+replace_attr(TopKRouter, "seq_aux_loss_load_balancing", seq_aux_loss_load_balancing)
+replace_attr(TopKRouter, "forward", forward)
