@@ -8,6 +8,13 @@ from contextlib import nullcontext
 
 def patch_before_import_megatron():
     # Import fused_layer_norm before transformer_engine
+    def patched_get_device_arch_version():
+        return torch.musa.get_device_properties(torch.musa.current_device()).major
+    import megatron.training.utils
+    megatron.training.utils.get_device_arch_version = patched_get_device_arch_version
+    import importlib
+    importlib.reload(megatron.training.arguments)
+    
     from . import fused_layer_norm
 
     from transformer_engine.pytorch.utils import get_device_compute_capability
@@ -45,6 +52,7 @@ def patch_before_import_megatron():
 
     from . import core_pipeline_parallel_schedules
     from . import yarn_rotary_pos_embedding
+    
     # Disable some unsupprted features
     # set_jit_fusion_options
     def set_jit_fusion_options():
