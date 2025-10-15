@@ -734,6 +734,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     if need_mlflow():
         mlflow.start_run()
 
+    from .moe_monitor import MoEMonitor
+    moe_monitor = MoEMonitor(model, iteration)
+
     with maybe_enable_profiling(
         args, global_step=iteration
     ) as torch_profiler:
@@ -771,6 +774,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                         optimizer,
                         opt_param_scheduler,
                         config)
+            
+            moe_monitor.step()
 
             if int(os.getenv("USE_EPX", "0")):
                 lcp = parallel_state.get_epx_data_parallel_lcp()

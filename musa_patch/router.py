@@ -1,52 +1,55 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+"""
+================================== MoE Router相关算法 ====================================
+moe_router_norm_before_softmax: 
+    默认关闭
+    开启: MOE_ROUTER_NORM_BEFORE_SOFTMAX=1
+    可设置缩放系数 (默认为1): i.e., MOE_ROUTER_NORM_SCALE=2
+=========================================================================================
+"""
 
-from functools import partial
+
+import os
 import torch
-
-from .moe_utils import (
-    sequence_load_balancing_loss_func,
-    topk_softmax_with_capacity,
-)
-
-def seq_aux_loss_load_balancing(self, logits: torch.Tensor, bsz: int, seq_length: int):
-    """Apply loss-based load balancing to the logits tensor."""
-
-    probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
-            logits,
-            self.topk,
-            capacity_factor=self.config.moe_expert_capacity_factor,
-            pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
-            drop_policy=self.config.moe_token_drop_policy,
-            use_pre_softmax=self.config.moe_router_pre_softmax,
-            num_groups=self.config.moe_router_num_groups,
-            group_topk=self.config.moe_router_group_topk,
-            scaling_factor=self.config.moe_router_topk_scaling_factor,
-            deterministic_mode=self.config.deterministic_mode,
-            score_function=self.score_function,
-            expert_bias=self.expert_bias,
-            device_level_capacity=self.config.moe_device_level_capacity,
-        )
-
-    if self.training:
-        scores, loss_routing_map = self.compute_routing_scores_for_aux_loss(logits)
-        aux_loss_func = partial(
-            sequence_load_balancing_loss_func,
-            probs=scores,
-            routing_map=loss_routing_map,
-            batch_size=bsz,
-            seq_length=seq_length,
-            topk=self.topk,
-            moe_router_topk_limited_devices=self.config.moe_router_group_topk,
-            moe_device_level_aux_loss_coeff=self.config.moe_device_level_aux_loss_coeff,
-            moe_comm_aux_loss_coeff=self.config.moe_comm_aux_loss_coeff,
-            moe_complementary_seq_aux_loss=self.config.moe_complementary_seq_aux_loss,
-        )
-        probs = self.apply_load_balancing_loss(
-            activation=probs, load_balancing_loss_func=aux_loss_func
-        )
-
-    return probs, routing_map
+import torch.nn.functional as F
+from megatron.core.transformer.moe.router import TopKRouter
 
 
-import megatron.core.transformer.moe.router
-megatron.core.transformer.moe.router.TopKRouter.seq_aux_loss_load_balancing = seq_aux_loss_load_balancing
+moe_router_norm_before_softmax = int(os.getenv('MOE_ROUTER_NORM_BEFORE_SOFTMAX', 0)) == 1
+moe_router_norm_scale = float(os.getenv('MOE_ROUTER_NORM_SCALE', 1))
+
+
+def router_forward_with_normalization(self, input: torch.Tensor):
+    """
+    Forward pass of the router.
+
+    Args:
+        input (torch.Tensor): Input tensor.
+    """
+    self._maintain_float32_expert_bias()
+
+    # Apply input jitter
+    input = self.apply_input_jitter(input)
+    logits = self.gating(input)
+
+    # ---- Add normalization before softmax ----
+    if moe_router_norm_before_softmax:
+        logits = F.layer_norm(
+            logits, 
+            normalized_shape=(logits.size(-1),), 
+            weight=None, bias=None)
+        logits.mul_(moe_router_norm_scale)
+    # ------------------------------------------
+
+    if self.config.moe_router_force_load_balancing:
+        # Apply force load balancing with random logits for benchmark
+        logits = apply_random_logits(logits)
+
+    scores, routing_map = self.routing(logits)
+    return scores, routing_map
+
+
+from transformer_engine.musa.pytorch.utils import replace_attr, add_attr
+if moe_router_norm_before_softmax and moe_router_norm_scale != 0.:
+    from megatron.core.transformer.moe.router import TopKRouter
+    replace_attr(TopKRouter, "forward", router_forward_with_normalization)
+
