@@ -1,11 +1,9 @@
 """
-==================================== MoE相关指标检测 =====================================
-默认关闭检测 gating logit variance, router softmax variance, 和负载均衡maxvio
-控制--gating logit variance监控: ROUTER_PROB_VAR_MONITOR_FREQ
-控制--router softmax variance监控: ROUTER_LOGIT_VAR_MONITOR_FREQ
-控制--负载均衡maxvio监控: ROUTER_MAXVIO_MONITOR_FREQ
-(default)设置为0, 即为关闭
-正数则是开启, 并set为记录步长; i.e., ROUTER_PROB_VAR_MONITOR_FREQ=2: 每隔2步计算并记录一次
+================================== MoE Monitor ====================================
+# 开启观测：数字代表统计和观测频率
+export ROUTER_PROB_VAR_MONITOR_FREQ=1
+export ROUTER_LOGIT_VAR_MONITOR_FREQ=1
+export ROUTER_MAXVIO_MONITOR_FREQ=1
 =========================================================================================
 """
 
