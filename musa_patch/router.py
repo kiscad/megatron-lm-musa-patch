@@ -8,7 +8,7 @@ export MOE_ROUTER_NORM_SCALE=1      # default缩放系数为 1
 
 ====== prob variance loss 算法 ====== (鼓励不同tokens在相同专家的score有差异)
 export ENABLE_MOE_AUX_VAR_LOSS=1
-export MOE_ROUTER_NORM_SCALE=10     # default coeff为 10
+export MOE_AUX_VAR_SCALE=10     # default coeff为 10
 =========================================================================================
 """
 
