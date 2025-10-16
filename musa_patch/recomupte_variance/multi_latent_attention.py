@@ -190,7 +190,7 @@ def MLASelfAttention_forward(
         mscale = 1.0
         if self.config.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(self.config.max_position_embeddings)
-        elif self.config.apply_rope_fusion:
+        elif False and self.config.apply_rope_fusion:
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                 self.config.max_position_embeddings, dtype=q_compressed.dtype
             )
@@ -203,7 +203,7 @@ def MLASelfAttention_forward(
         else:
             rotary_pos_emb, mscale = self.rotary_pos_emb(self.config.max_position_embeddings)
 
-        if self.config.apply_rope_fusion:
+        if False and self.config.apply_rope_fusion:
             query = fused_apply_mla_rope_for_q(
                 q,
                 rotary_pos_cos,

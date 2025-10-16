@@ -81,8 +81,8 @@ def router_init_func(
         self.local_tokens_per_expert = None
         self.expert_bias = None
 
-    self.enable_moe_router_norm = float(os.getenv('ENABLE_MOE_ROUTER_NORM', 0))
-    self.enable_moe_aux_var_loss = float(os.getenv('ENABLE_MOE_AUX_VAR_LOSS', 0))
+    self.enable_moe_router_norm = os.getenv('ENABLE_MOE_ROUTER_NORM', 0)
+    self.enable_moe_aux_var_loss = os.getenv('ENABLE_MOE_AUX_VAR_LOSS', 0)
 
     self.moe_router_norm_scale = float(os.getenv('MOE_ROUTER_NORM_SCALE', 1))
     self.moe_aux_var_scale = float(os.getenv('MOE_AUX_VAR_SCALE', 10)) # should be the same as the seq-length?
