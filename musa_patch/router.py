@@ -33,6 +33,10 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.transformer.moe.router import TopKRouter
 from transformer_engine.musa.pytorch.utils import replace_attr, add_attr
 
+from megatron.training.global_vars import (
+    get_args,
+)
+
 
 def sequence_load_balancing_variance_func(
     probs: torch.Tensor,
@@ -81,10 +85,16 @@ def router_init_func(
         self.local_tokens_per_expert = None
         self.expert_bias = None
 
-    self.enable_moe_router_norm = os.getenv('ENABLE_MOE_ROUTER_NORM', 0)
+    self.args = get_args()
+
+    self.norm_before_router_softmax = bool(self.args.norm_before_router_softmax)
+    self.use_unbias_norm = bool(self.args.use_unbias_norm)
+    self.moe_router_norm_scale = float(self.args.moe_router_norm_scale)
+
+    # self.enable_moe_router_norm = os.getenv('ENABLE_MOE_ROUTER_NORM', 0)
     self.enable_moe_aux_var_loss = os.getenv('ENABLE_MOE_AUX_VAR_LOSS', 0)
 
-    self.moe_router_norm_scale = float(os.getenv('MOE_ROUTER_NORM_SCALE', 1))
+    # self.moe_router_norm_scale = float(os.getenv('MOE_ROUTER_NORM_SCALE', 1))
     self.moe_aux_var_scale = float(os.getenv('MOE_AUX_VAR_SCALE', 10)) # should be the same as the seq-length?
 
 
@@ -191,12 +201,18 @@ def forward(self, input: torch.Tensor):
     logits = self.gating(input)
 
     # ---- Add normalization before softmax ----
-    if self.enable_moe_router_norm and self.moe_router_norm_scale > 0.:
-        logits = F.layer_norm(
-            logits, 
-            normalized_shape=(logits.size(-1),),
-            weight=None, bias=None)
-        logits.mul_(self.moe_router_norm_scale)
+    if self.norm_before_router_softmax and self.moe_router_norm_scale > 0.:
+        if self.use_unbias_norm:
+            mean = logits.mean(dim=-1, keepdim=True)
+            std = logits.std(dim=-1, keepdim=True) + 1e-6
+            logits = (logits - mean) / std
+            logits = self.moe_router_norm_scale * logits
+        else:
+            logits = F.layer_norm(
+                logits, 
+                normalized_shape=(logits.size(-1),),
+                weight=None, bias=None)
+            logits.mul_(self.moe_router_norm_scale)
     # ------------------------------------------
 
     if self.config.moe_router_force_load_balancing:

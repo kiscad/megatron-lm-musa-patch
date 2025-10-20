@@ -169,6 +169,15 @@ def _add_moe_args(parser):
     ## HACK(huang.huang)
     group.add_argument('--offload-moe-fc1-input', action='store_true',
                     help="Whether to offload moe fc1 to cpu")
+    
+    ## HACK(yiming.chen)
+    group.add_argument('--norm-before-router-softmax', action='store_true',
+                    help="add Layer-Norm before router softmax operator")
+    group.add_argument('--use-unbias-norm', action='store_true',
+                    help="use the unbias Layer-Norm before router softmax operator")
+    group.add_argument('--moe-router-norm-scale', type=float, default=1.0,
+                    help="coefficient for norm-before-router-softmax")
+    
     return parser
 
 
@@ -251,6 +260,12 @@ def core_transformer_config_from_args(args, config_class=None):
     config_instance.tp_only_amax_red = args.tp_only_amax_red
     ##HACK(huang.huang)
     config_instance.offload_moe_fc1_input = args.offload_moe_fc1_input
+
+    ##HACK(yiming.chen)
+    config_instance.norm_before_router_softmax = args.norm_before_router_softmax
+    config_instance.use_unbias_norm = args.use_unbias_norm
+    config_instance.moe_router_norm_scale = args.moe_router_norm_scale
+
     print('config_instance is ', config_instance)
     return config_instance
 
