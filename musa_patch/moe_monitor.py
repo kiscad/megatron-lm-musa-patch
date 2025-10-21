@@ -1,20 +1,19 @@
 """
 ================================== MoE Monitor ====================================
-# 开启观测：数字代表统计和观测频率
-export ROUTER_PROB_VAR_MONITOR_FREQ=1
-export ROUTER_LOGIT_VAR_MONITOR_FREQ=1
-export ROUTER_MAXVIO_MONITOR_FREQ=1
-=========================================================================================
+# 开启观测：数字代表统计和观测频率 (来自 args)
+# --router-prob-var-mointor-freq 2
+# --router-logit-var-mointor-freq 2
+# --router-maxvio-mointor-freq 2
+===================================================================================
 """
 
 
-import os
 import re
 from collections import defaultdict
 import types
 import functools
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 import torch.distributed as dist
@@ -40,16 +39,23 @@ class MoEMonitor():
         self.model = model
         self.iteration = iteration
 
-        self.router_prob_var_mointor_freq = int(os.getenv('ROUTER_PROB_VAR_MONITOR_FREQ', 0))
-        self.router_logit_var_mointor_freq = int(os.getenv('ROUTER_LOGIT_VAR_MONITOR_FREQ', 0))
-        self.router_maxvio_mointor_freq = int(os.getenv('ROUTER_MAXVIO_MONITOR_FREQ', 0))
+        self.args = get_args()
+        self.router_prob_var_mointor_freq  = int(self.args.router_prob_var_mointor_freq)
+        self.router_logit_var_mointor_freq = int(self.args.router_logit_var_mointor_freq)
+        self.router_maxvio_mointor_freq    = int(self.args.router_maxvio_mointor_freq)
 
         if self.router_prob_var_mointor_freq > 0:
-            self.prob_var_mointor = MoERouterProbVarianceMonitor(model, global_iteration=iteration, log_every=self.router_prob_var_mointor_freq)
+            self.prob_var_mointor = MoERouterProbVarianceMonitor(
+                model, global_iteration=iteration, log_every=self.router_prob_var_mointor_freq
+            )
         if self.router_logit_var_mointor_freq > 0:
-            self.logit_var_mointor = MoEGatingLogitVarianceMonitor(model, global_iteration=iteration, log_every=self.router_logit_var_mointor_freq)
+            self.logit_var_mointor = MoEGatingLogitVarianceMonitor(
+                model, global_iteration=iteration, log_every=self.router_logit_var_mointor_freq
+            )
         if self.router_maxvio_mointor_freq > 0:
-            self.maxvio_mointor = MoELoadBalanceMaxVioMonitor(model, global_iteration=iteration, log_every=self.router_maxvio_mointor_freq)
+            self.maxvio_mointor = MoELoadBalanceMaxVioMonitor(
+                model, global_iteration=iteration, log_every=self.router_maxvio_mointor_freq
+            )
     
     def step(self):
         if self.router_prob_var_mointor_freq > 0:
@@ -86,6 +92,7 @@ class _MoEMonitorBase(ABC):
         self._writer_rank: int = -1
 
         self.pp_layer_offset = self._compute_pp_layer_offset()
+        self._orig_methods: Dict[tuple, callable] = {}
 
         root = model[0] if isinstance(model, (list, tuple)) else model
         self._install(root)
@@ -93,9 +100,6 @@ class _MoEMonitorBase(ABC):
     @abstractmethod
     def _install(self, model):
         ...
-
-    def unpatch(self, model):
-        return
 
     def _accumulate(self, global_layer_idx: int, value: torch.Tensor):
         v = value.detach().to(torch.float32)
@@ -214,24 +218,32 @@ class MoERouterProbVarianceMonitor(_MoEMonitorBase):
                 continue
 
             global_idx = self.pp_layer_offset + local_idx  # 0-based
+            module_id  = id(module)
+            key = (module_id , "routing")
+            if key in self._orig_methods:
+                continue
 
-            def _make_hook(layer_idx: int):
-                def hook(_module, _inp, output: Tuple[torch.Tensor, torch.Tensor]):
-                    if (self.global_iteration % self.log_every) == 0:
+            orig_routing = module.routing
+
+            def make_wrapped(orig_fn, layer_idx: int):
+                @functools.wraps(orig_fn)
+                def wrapped_routing(this: TopKRouter, *args, **kwargs):
+                    scores, routing_map = orig_fn(*args, **kwargs)
+                    if (self.global_iteration % self.log_every) == 0 and torch.is_grad_enabled():
                         with torch.no_grad():
-                            scores = output[0]
                             s = scores.to(torch.float32)
                             token_var = s.var(dim=-1, unbiased=False).mean()
                             self._accumulate(layer_idx, token_var)
-                return hook
+                    return scores, routing_map
+                return wrapped_routing
 
-            module.register_forward_hook(_make_hook(global_idx))
+            module.routing = types.MethodType(make_wrapped(orig_routing, global_idx), module)
+            self._orig_methods[key] = orig_routing
 
 
 # ============== logits（softmax 前） ==============
 class MoEGatingLogitVarianceMonitor(_MoEMonitorBase):
     def __init__(self, model, global_iteration, log_every: int = 1):
-        self._orig_gating: Dict[int, callable] = {}
         super().__init__(model, global_iteration, log_every=log_every, tag_prefix="router_logit_variance")
 
     def _install(self, model):
@@ -243,17 +255,18 @@ class MoEGatingLogitVarianceMonitor(_MoEMonitorBase):
                 continue
 
             global_idx = self.pp_layer_offset + local_idx  # 0-based
-            mid = id(module)
-            if mid in self._orig_gating:
+            module_id  = id(module)
+            key = (module_id , "gating")
+            if key in self._orig_methods:
                 continue
 
-            orig = module.gating
+            orig_gating = module.gating
 
             def make_wrapped(orig_fn, layer_idx: int):
                 @functools.wraps(orig_fn)
                 def wrapped_gating(this: TopKRouter, *args, **kwargs):
                     logits = orig_fn(*args, **kwargs)
-                    if (self.global_iteration % self.log_every) == 0:
+                    if (self.global_iteration % self.log_every) == 0 and torch.is_grad_enabled():
                         with torch.no_grad():
                             s = logits.to(torch.float32)
                             token_var = s.var(dim=-1, unbiased=False).mean()
@@ -261,19 +274,11 @@ class MoEGatingLogitVarianceMonitor(_MoEMonitorBase):
                     return logits
                 return wrapped_gating
 
-            module.gating = types.MethodType(make_wrapped(orig, global_idx), module)
-            self._orig_gating[mid] = orig
-
-    def unpatch(self, model):
-        root = model[0] if isinstance(model, (list, tuple)) else model
-        for _, module in root.named_modules():
-            if isinstance(module, TopKRouter):
-                mid = id(module)
-                if mid in self._orig_gating:
-                    module.gating = types.MethodType(self._orig_gating[mid], module)
-        self._orig_gating.clear()
+            module.gating = types.MethodType(make_wrapped(orig_gating, global_idx), module)
+            self._orig_methods[key] = orig_gating
 
 
+# ============== MaxVio(基于 routing_map) ==============
 class MoELoadBalanceMaxVioMonitor(_MoEMonitorBase):
     def __init__(self, model, global_iteration, log_every: int = 1, eps: float = 1e-6):
         self.eps = float(eps)
@@ -288,24 +293,32 @@ class MoELoadBalanceMaxVioMonitor(_MoEMonitorBase):
                 continue
 
             global_idx = self.pp_layer_offset + local_idx
+            module_id  = id(module)
+            key = (module_id , "routing")
+            if key in self._orig_methods:
+                continue
 
-            def _make_hook(layer_idx: int):
-                def hook(_module, _inp, output):
-                    if (self.global_iteration % self.log_every) == 0:
+            orig_routing = module.routing
+
+            def make_wrapped(orig_fn, layer_idx: int):
+                @functools.wraps(orig_fn)
+                def wrapped_routing(this: TopKRouter, *args, **kwargs):
+                    scores, routing_map = orig_fn(*args, **kwargs)
+                    if (self.global_iteration % self.log_every) == 0 and torch.is_grad_enabled():
                         with torch.no_grad():
-                            _, routing_map = output
                             counts = routing_map.sum(dim=0, dtype=torch.float32)
                             total  = counts.sum()
                             max_c  = counts.amax(dim=0)
                             E = counts.numel()
-
                             # MaxVio = max/mean - 1 = (max * E / total) - 1；total==0 时置 0
                             maxvio = torch.where(
                                 total > 0,
                                 (max_c * E / total) - 1.0,
                                 torch.zeros((), dtype=counts.dtype, device=counts.device)
                             )
-
                             self._accumulate(layer_idx, maxvio)
-                return hook
-            module.register_forward_hook(_make_hook(global_idx))
+                    return scores, routing_map
+                return wrapped_routing
+
+            module.routing = types.MethodType(make_wrapped(orig_routing, global_idx), module)
+            self._orig_methods[key] = orig_routing
