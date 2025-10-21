@@ -125,7 +125,8 @@ def MoELayer_forward(self: "MoELayer", hidden_states: torch.Tensor, norm_func: O
             #forward for linear1 and act in self.experts
             tokens_per_expert = tokens_per_expert.tolist()
 
-            if self.experts.config.fp8 and not self.experts.config.moe_router_padding_for_fp8:
+            if False and self.experts.config.fp8 and not self.experts.config.moe_router_padding_for_fp8:
+                # TODO(yehua.zhang): musa groupgemm do not need to unpadding
                 actual_tokens_per_expert = tokens_per_expert
                 permuted_local_hidden_states, tokens_per_expert = self.experts.fp8_padding(
                     permuted_local_hidden_states, tokens_per_expert
@@ -231,9 +232,9 @@ def MoELayer_forward(self: "MoELayer", hidden_states: torch.Tensor, norm_func: O
                     expert_output, mlp_bias = tensor_parallel.checkpoint(
                         custom_expert_forward, False, dispatched_input, permuted_probs)
             
-                    
-            if self.experts.config.fp8 and not self.experts.config.moe_router_padding_for_fp8:
-                expert_output = self.experts.fp8_unpadding(expert_output, tokens_per_expert.tolist())
+            # TODO(yehua.zhang): musa groupgemm do not need to unpadding        
+            # if self.experts.config.fp8 and not self.experts.config.moe_router_padding_for_fp8:
+            #    expert_output = self.experts.fp8_unpadding(expert_output, tokens_per_expert.tolist())
             if self.config.offload_moe_fc1_input: 
                 # LaunchReloadFunction after experts.forward, same as expert.py 
                 assert self.config.recompute_variance, "mlp_recompute with offload only support recompute_variant only"
