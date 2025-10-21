@@ -44,6 +44,10 @@ def MoELayer_forward(self: "MoELayer", hidden_states: torch.Tensor, norm_func: O
             "are enabled without also enabling sequence parallelism."
         )
 
+    if self.config.offload_moe_fc1_input:
+        if self.config.mlp_recompute:
+            assert self.config.recompute_variance, "mlp_recompute with offload only support recompute_variant only"
+        hidden_states = LaunchReloadFunction.apply(hidden_states, 'fc1_inp')
     # process MoE
     def custom_forward(hidden_states):
         if norm_func is not None:
@@ -235,10 +239,6 @@ def MoELayer_forward(self: "MoELayer", hidden_states: torch.Tensor, norm_func: O
             # TODO(yehua.zhang): musa groupgemm do not need to unpadding        
             # if self.experts.config.fp8 and not self.experts.config.moe_router_padding_for_fp8:
             #    expert_output = self.experts.fp8_unpadding(expert_output, tokens_per_expert.tolist())
-            if self.config.offload_moe_fc1_input: 
-                # LaunchReloadFunction after experts.forward, same as expert.py 
-                assert self.config.recompute_variance, "mlp_recompute with offload only support recompute_variant only"
-                expert_output = LaunchReloadFunction.apply(expert_output, 'fc1_inp')
         else:
             expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
         
