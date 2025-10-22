@@ -206,13 +206,10 @@ def patch_after_import_torch():
 
     # 5. disable dynamo
     import os
-    os.environ["NVTE_TORCH_COMPILE"] = "0"
-    os.environ["TORCHDYNAMO_DISABLE"] = "1"
-
-    def noop(func):
-        return func
-    torch.compile = noop
-    torch.jit.script = noop
+    #HACK(sherry): enable torch.compile
+    os.environ["NVTE_TORCH_COMPILE"] = "1"
+    os.environ["TORCHDYNAMO_DISABLE"] = "0"
+    #HACK(sherry)
 
     def get_device_capability_musa():
         return [8, 3]
