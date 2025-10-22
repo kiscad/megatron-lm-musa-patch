@@ -2,8 +2,12 @@
 ================================== MoE Router相关算法 ====================================
 
 ====== Norm before router softmax相关算法 ======
-export ENABLE_MOE_ROUTER_NORM=1
-export MOE_ROUTER_NORM_SCALE=1      # default缩放系数为 1
+group.add_argument('--norm-before-router-softmax', action='store_true',
+                help="add Layer-Norm before router softmax operator")
+group.add_argument('--use-unbiased-norm', action='store_true',
+                help="use the unbiased Layer-Norm before router softmax operator")
+group.add_argument('--moe-router-norm-scale', type=float, default=1.0,
+                help="coefficient for norm-before-router-softmax")
 
 
 ====== prob variance loss 算法 ====== (鼓励不同tokens在相同专家的score有差异)
@@ -88,7 +92,7 @@ def router_init_func(
     self.args = get_args()
 
     self.norm_before_router_softmax = bool(self.args.norm_before_router_softmax)
-    self.use_unbias_norm = bool(self.args.use_unbias_norm)
+    self.use_unbiased_norm = bool(self.args.use_unbiased_norm)
     self.moe_router_norm_scale = float(self.args.moe_router_norm_scale)
 
     # self.enable_moe_router_norm = os.getenv('ENABLE_MOE_ROUTER_NORM', 0)
@@ -187,22 +191,20 @@ def apply_load_balancing_variance(
     return activation
 
 
-def forward(self, input: torch.Tensor):
-    """
-    Forward pass of the router.
+def routing(self, logits: torch.Tensor):
+    """Top-k routing function
 
     Args:
-        input (torch.Tensor): Input tensor.
+        logits (torch.Tensor): Logits tensor after gating.
+
+    Returns:
+        probs (torch.Tensor): The probabilities of token to experts assignment.
+        routing_map (torch.Tensor): The mapping of token to experts assignment,
+            with shape [num_tokens, num_experts].
     """
-    self._maintain_float32_expert_bias()
-
-    # Apply input jitter
-    input = self.apply_input_jitter(input)
-    logits = self.gating(input)
-
     # ---- Add normalization before softmax ----
     if self.norm_before_router_softmax and self.moe_router_norm_scale > 0.:
-        if self.use_unbias_norm:
+        if self.use_unbiased_norm:
             mean = logits.mean(dim=-1, keepdim=True)
             std = logits.std(dim=-1, keepdim=True) + 1e-6
             logits = (logits - mean) / std
@@ -215,15 +217,45 @@ def forward(self, input: torch.Tensor):
             logits.mul_(self.moe_router_norm_scale)
     # ------------------------------------------
 
-    if self.config.moe_router_force_load_balancing:
-        # Apply force load balancing with random logits for benchmark
-        logits = apply_random_logits(logits)
+    seq_length, bsz = logits.shape[:2]
+    logits = logits.view(-1, self.config.num_moe_experts)
 
-    scores, routing_map = self.routing(logits)
+    # Apply Z-Loss
+    logits = self.apply_z_loss(logits)
+
+    if self.routing_type == "sinkhorn":
+        scores, routing_map = self.sinkhorn_load_balancing(logits)
+    elif self.routing_type == "aux_loss":
+        scores, routing_map = self.aux_loss_load_balancing(logits)
+    elif self.routing_type == "seq_aux_loss":
+        scores, routing_map = self.seq_aux_loss_load_balancing(logits, bsz, seq_length)
+    elif self.routing_type == "none":
+        # A naive top-k routing without load balancing
+        scores, routing_map, _ = topk_softmax_with_capacity(
+            logits,
+            self.topk,
+            capacity_factor=self.config.moe_expert_capacity_factor,
+            pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+            drop_policy=self.config.moe_token_drop_policy,
+            use_pre_softmax=self.config.moe_router_pre_softmax,
+            num_groups=self.config.moe_router_num_groups,
+            group_topk=self.config.moe_router_group_topk,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
+            deterministic_mode=self.config.deterministic_mode,
+            score_function=self.score_function,
+            expert_bias=self.expert_bias,
+        )
+    else:
+        raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
+    # Prevent extra local tokens accumulation on evaluation or activation recomputation
+    if self.enable_expert_bias and torch.is_grad_enabled():
+        with torch.no_grad():
+            self.local_tokens_per_expert += routing_map.sum(dim=0)
+
     return scores, routing_map
 
 
 add_attr(TopKRouter, "apply_load_balancing_variance", apply_load_balancing_variance)
 replace_attr(TopKRouter, "__init__", router_init_func)
 replace_attr(TopKRouter, "seq_aux_loss_load_balancing", seq_aux_loss_load_balancing)
-replace_attr(TopKRouter, "forward", forward)
+replace_attr(TopKRouter, "routing", routing)
