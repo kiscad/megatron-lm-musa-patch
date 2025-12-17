@@ -10,6 +10,7 @@ import torch.distributed
 from megatron.core import mpu
 
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.training.global_vars import (
     get_args,
     get_timers,
@@ -39,6 +40,7 @@ from megatron.training.training import (
     save_checkpoint_and_time,
     train_step,
     evaluate_and_print_results,
+    dummy_train_step
 )
 from megatron.training.async_utils import maybe_finalize_async_save
 from megatron.core.num_microbatches_calculator import (
@@ -489,8 +491,30 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             )
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
-        track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging, moe_layer_freq=args.moe_layer_freq)
-
+        track_names = []
+        if args.moe_router_load_balancing_type in ["aux_loss", "seq_aux_loss"]:
+            track_names.append("load_balancing_loss")
+        if args.moe_z_loss_coeff is not None:
+            track_names.append("z_loss")
+        # track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging, moe_layer_freq=args.moe_layer_freq)
+        track_moe_metrics(
+            loss_scale=moe_loss_scale,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            total_loss_dict=total_loss_dict,
+            per_layer_logging=args.moe_per_layer_logging,
+            force_initialize=True,
+            track_names=track_names,
+            num_layers=args.num_layers,
+            moe_layer_freq=args.moe_layer_freq,
+            mtp_num_layers=args.mtp_num_layers,
+        )
+    if args.mtp_num_layers is not None:
+        mtp_loss_scale = 1 / get_num_microbatches()
+        MTPLossLoggingHelper.track_mtp_metrics(
+            mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
+        )
     if iteration % args.log_interval == 0:
         # HACK(huang.huang): support memory analysis dump
         if args.record_memory_history:
@@ -766,6 +790,18 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             num_microbatches = get_num_microbatches()
             update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
+            # Completely skip iteration if needed.
+            if iteration in args.iterations_to_skip:
+                # Dummy train_step to fast forward train_data_iterator.
+                dummy_train_step(train_data_iterator)
+                iteration += 1
+                batch_size = (
+                    mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
+                )
+                args.consumed_train_samples += batch_size
+                args.skipped_train_samples += batch_size
+                continue
+                
             args.curr_iteration = iteration
             loss_dict, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad = \
                 train_step(forward_step_func,

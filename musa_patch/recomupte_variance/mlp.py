@@ -26,8 +26,8 @@ from transformer_engine.pytorch.distributed import checkpoint, checkpointVirance
 # support mlp_rms_recompute,  which combine rms, mlp into one checkpoint;
 # add new arg "no_recompute" to avoid repated recompute for sharedEXP while 
 # moe_layer is already recomputed outsides
-def MLP_forward(self: "MLP", hidden_states: torch.Tensor, norm_func: Optional[Callable] = None, 
-                per_token_scale: Optional[torch.Tensor] = None, no_recompute: bool = False):
+def MLP_forward(self: "MLP", hidden_states: torch.Tensor, per_token_scale: Optional[torch.Tensor] = None,
+                norm_func: Optional[Callable] = None, no_recompute: bool = False):
     """
     Perform the forward pass through the MLP block.
     Args:

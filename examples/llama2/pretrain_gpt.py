@@ -77,9 +77,19 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             transformer_layer_spec = import_module(args.spec)
         else:
             if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm, args.fp8)
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    args.num_experts,
+                    args.moe_grouped_gemm,
+                    args.qk_layernorm,
+                    args.multi_latent_attention,
+                    args.moe_use_legacy_grouped_gemm
+                )
             else:
-                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
+                transformer_layer_spec = get_gpt_layer_local_spec(
+                    args.num_experts,
+                    args.moe_grouped_gemm,
+                    args.qk_layernorm
+                )
 
         build_model_context = nullcontext
         build_model_context_args = {}
@@ -164,8 +174,8 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
 
     # Reduce loss for logging.
     reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-
+    if not int(os.getenv("NO_LOSS_REDUCE", 0)): #TODO:(huang.huang) will influence the loss reported Now!
+        torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
     local_num_tokens = loss[1].clone().detach().to(torch.int)
     return (
         loss[0] * args.context_parallel_size,
@@ -217,7 +227,7 @@ def core_gpt_dataset_config_from_args(args):
             get_blend_from_list(args.valid_data_path),
             get_blend_from_list(args.test_data_path)
         ],
-        renormalize_blend_weights=args.renormalize_blend_weights,
+        # renormalize_blend_weights=args.renormalize_blend_weights,
         split=args.split,
         num_dataset_builder_threads=args.num_dataset_builder_threads,
         path_to_cache=args.data_cache_path,
@@ -227,7 +237,6 @@ def core_gpt_dataset_config_from_args(args):
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         create_attention_mask=args.create_attention_mask_in_dataloader,
-        s3_cache_path = args.s3_cache_path
     )
 
 

@@ -8,6 +8,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
+from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 from megatron.core.utils import (
     get_attr_wrapped_model,
     get_model_type,
@@ -160,10 +161,27 @@ def forward_step(
         loss_scale = (
             config.grad_scale_func(torch.ones(1, device=output_tensor.device))
             if config.grad_scale_func is not None
-            else torch.tensor(1.0)
+            else torch.ones(1, device=output_tensor.device)
         )
         # Set the loss scale
-        MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+        if config.calculate_per_token_loss:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+    # Set the loss scale for Multi-Token Prediction (MTP) loss.
+    if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
+        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        loss_scale = (
+            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.ones(1, device=output_tensor.device)
+        )
+        # Set the loss scale
+        if config.calculate_per_token_loss:
+            MTPLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     # If T5 model and in decoder stack, then send encoder_hidden_state
     # downstream as well.
@@ -214,10 +232,16 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     if output_tensor_grad[0] is None and config.grad_scale_func is not None:
         output_tensor[0] = config.grad_scale_func(output_tensor[0])
 
-    if config.deallocate_pipeline_outputs:
-        custom_backward(output_tensor[0], output_tensor_grad[0])
-    else:
-        torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+    # In multi-modal models like VLM, some batches may not have images.
+    # When no image is present, the vision encoder (as a separate pipeline stage)
+    # will not participate in the computation.
+    # This results in a tensor that does not require gradients.
+    # In such cases, we intentionally skip the backward pass while preserving zero gradients.
+    if output_tensor[0].requires_grad:
+        if config.deallocate_pipeline_outputs:
+            custom_backward(output_tensor[0], output_tensor_grad[0])
+        else:
+            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]

@@ -112,7 +112,9 @@ def MoELayer_forward(self: "MoELayer", hidden_states: torch.Tensor, norm_func: O
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(dispatched_input, probs)
         )
-        custom_expert_forward = partial(self.experts, tokens_per_expert=tokens_per_expert)
+        custom_expert_forward = lambda x, z: self.experts(permuted_local_hidden_states=x,
+                                                        tokens_per_expert=tokens_per_expert,
+                                                        permuted_probs=z)
    
         def _custom_func_first(permuted_local_hidden_states, permuted_probs, tokens_per_expert):
             """Forward of TEGroupedMLP

@@ -227,7 +227,7 @@ def MLASelfAttention_forward(
             if inference_context is not None:
                 # add offset to the sequence start for inference
                 sequence_start = inference_context.sequence_len_offset
-                sequence_end = inference_context + q_len
+                sequence_end = sequence_start + q_len
                 rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end] # type: ignore
             else:
                 # Shorten rotary_pos_emb to the sequence length when inference_params

@@ -77,11 +77,16 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_output):
+        """Backward."""
         input, weight = ctx.saved_tensors
+        main_grad = ctx.main_grad
         use_bias = ctx.use_bias
         grad_output_buffer = ctx.grad_output_buffer
         wgrad_deferral_limit = ctx.wgrad_deferral_limit
         
+        if ctx.gradient_accumulation_fusion:
+            weight.main_grad = main_grad
+
         wgrad_compute = True
         # if grad_output_buffer is not None:
         #     grad_output_buffer.append(grad_output)
