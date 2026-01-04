@@ -801,7 +801,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 args.consumed_train_samples += batch_size
                 args.skipped_train_samples += batch_size
                 continue
-                
+
             args.curr_iteration = iteration
             loss_dict, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad = \
                 train_step(forward_step_func,
@@ -810,7 +810,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                         optimizer,
                         opt_param_scheduler,
                         config)
-            
+
             moe_monitor.step()
 
             if int(os.getenv("USE_EPX", "0")):
@@ -989,7 +989,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
         ft_integration.get_rank_monitor_client().shutdown_workload_monitoring()
 
-    maybe_finalize_async_save(blocking=True)
+    # This will finalize all unfinalized async request and terminate
+    # a persistent async worker if persistent ckpt worker is enabled
+    maybe_finalize_async_save(blocking=True, terminate=(should_exit is True))
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
