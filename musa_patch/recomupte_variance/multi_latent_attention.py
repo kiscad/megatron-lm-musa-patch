@@ -186,6 +186,10 @@ def MLASelfAttention_forward(
         else:
             cu_seqlens_q = cu_seqlens_kv = None   
 
+        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+            inference_context, None, hidden_states, self.config, packed_seq_params
+        )
+
         # rotary_pos_emb:[s, b, 1, 64]
         mscale = 1.0
         if self.config.rope_type == "rope":
@@ -201,7 +205,7 @@ def MLASelfAttention_forward(
                 and fused_apply_mla_rope_for_kv is not None
             ), "Fused MLA RoPE apply is not imported successfully"
         else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(self.config.max_position_embeddings)
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len)
 
         if False and self.config.apply_rope_fusion:
             query = fused_apply_mla_rope_for_q(
