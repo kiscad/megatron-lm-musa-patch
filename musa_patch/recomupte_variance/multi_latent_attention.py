@@ -187,13 +187,13 @@ def MLASelfAttention_forward(
             cu_seqlens_q = cu_seqlens_kv = None   
 
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-            inference_context, None, hidden_states, self.config, packed_seq_params
+            inference_context, None, q_compressed, self.config, packed_seq_params
         )
 
         # rotary_pos_emb:[s, b, 1, 64]
         mscale = 1.0
         if self.config.rope_type == "rope":
-            rotary_pos_emb = self.rotary_pos_emb(self.config.max_position_embeddings)
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
         elif False and self.config.apply_rope_fusion:
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                 self.config.max_position_embeddings, dtype=q_compressed.dtype
