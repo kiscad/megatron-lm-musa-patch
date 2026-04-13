@@ -118,10 +118,13 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     reporting_loss = loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
     local_num_tokens = loss[1].clone().detach().to(torch.int)
+    # MUSA training_log expects the older tuple contract during training, while
+    # Megatron evaluation expects a two-element tensor and calls .view(-1).
+    loss_report = (reporting_loss[0], reporting_loss[1]) if torch.is_grad_enabled() else reporting_loss
     return (
         loss[0] * args.context_parallel_size,
         local_num_tokens,
-        {"lm loss": (reporting_loss[0], reporting_loss[1])},
+        {"lm loss": loss_report},
     )
 
 
