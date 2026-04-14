@@ -36,13 +36,16 @@ from megatron.training import get_args, get_timers, pretrain
 from megatron.training.utils import unwrap_model
 
 
+KIMI_MEDIA_PLACEHOLDER_TOKEN = "<|media_pad|>"
+
+
 def add_kimi_k25_vl_extra_args(parser):
     parser = add_multimodal_extra_args(parser)
     parser.set_defaults(
         vision_model_type="moonvit",
         dataloader_type="external",
         tokenizer_type="MultimodalTokenizer",
-        special_tokens=["<image>"],
+        special_tokens=[KIMI_MEDIA_PLACEHOLDER_TOKEN],
         image_tag_type="",
         max_num_tiles=1,
         use_tiling=False,
@@ -67,6 +70,10 @@ def add_kimi_k25_vl_extra_args(parser):
     group.add_argument("--kimi-vision-num-layers", type=int, default=27)
     group.add_argument("--kimi-vision-num-attention-heads", type=int, default=16)
     group.add_argument("--kimi-vision-merge-kernel-size", type=int, default=2)
+    group.add_argument("--kimi-vision-init-pos-emb-height", type=int, default=64)
+    group.add_argument("--kimi-vision-init-pos-emb-width", type=int, default=64)
+    group.add_argument("--kimi-vision-init-pos-emb-time", type=int, default=4)
+    group.add_argument("--kimi-media-placeholder-token", type=str, default=KIMI_MEDIA_PLACEHOLDER_TOKEN)
     return parser
 
 
