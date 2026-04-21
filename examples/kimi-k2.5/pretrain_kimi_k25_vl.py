@@ -27,6 +27,7 @@ from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_rank,
@@ -74,8 +75,48 @@ def add_kimi_k25_vl_extra_args(parser):
     group.add_argument("--kimi-vision-init-pos-emb-width", type=int, default=64)
     group.add_argument("--kimi-vision-init-pos-emb-time", type=int, default=4)
     group.add_argument("--kimi-media-placeholder-token", type=str, default=KIMI_MEDIA_PLACEHOLDER_TOKEN)
+    group.add_argument("--use-thd-attention", action="store_true")
     return parser
 
+
+def build_thd_packed_seq_params(
+    tokens: torch.Tensor,
+    image_token_index: int,
+    num_image_tiles: torch.Tensor,
+    img_seq_len: int,
+    max_sequence_length: int,
+) -> PackedSeqParams:
+    """Build THD packed-sequence metadata for Kimi's expanded multimodal sequence."""
+
+    assert tokens is not None, "tokens are required to build THD packed sequence params"
+    assert tokens.dim() == 2, f"expected tokens to be [batch, seq], got {tokens.shape}"
+    assert (
+        tokens.size(0) == 1
+    ), "Kimi THD attention path currently supports micro-batch-size=1 only"
+    assert num_image_tiles is not None, "num_image_tiles are required for Kimi THD attention"
+
+    num_images_per_sample = torch.sum(tokens == image_token_index, dim=-1)
+    num_image_tiles_batch = num_image_tiles.split(num_images_per_sample.tolist(), dim=0)
+    num_image_tiles_batch = torch.stack([tiles.sum() for tiles in num_image_tiles_batch]).to(
+        dtype=torch.int32, device=tokens.device
+    )
+
+    text_seq_len = tokens.size(1)
+    seq_lens = num_image_tiles_batch * img_seq_len - num_images_per_sample + text_seq_len
+    if max_sequence_length is not None:
+        seq_lens = torch.clamp(seq_lens, max=max_sequence_length)
+
+    max_seqlen = int(seq_lens.max().item())
+    cu_seqlens = torch.zeros(tokens.size(0) + 1, dtype=torch.int32, device=tokens.device)
+    cu_seqlens[1:] = torch.cumsum(seq_lens.to(torch.int32), dim=0)
+
+    return PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+    )
 
 def get_batch(data_iterator):
     """Generate a multimodal batch and broadcast it across TP ranks."""
@@ -141,6 +182,8 @@ def forward_step(data_iterator, model):
 
     if args.context_parallel_size > 1:
         raise NotImplementedError("Initial Kimi-K2.5-VL pretraining path only supports context_parallel_size=1.")
+    if args.use_thd_attention and get_pipeline_model_parallel_world_size() > 1:
+        raise NotImplementedError("Kimi THD attention path currently supports pipeline-model-parallel-size=1 only.")
 
     timers("batch-generator", log_level=2).start()
     (
@@ -155,6 +198,16 @@ def forward_step(data_iterator, model):
     timers("batch-generator").stop()
 
     unwrapped_model = unwrap_model(model)
+    packed_seq_params = None
+    if args.use_thd_attention:
+        packed_seq_params = build_thd_packed_seq_params(
+            tokens=tokens,
+            image_token_index=unwrapped_model.image_token_index,
+            num_image_tiles=num_image_tiles,
+            img_seq_len=unwrapped_model.img_seq_len,
+            max_sequence_length=args.decoder_seq_length,
+        )
+
     output_tensor, new_loss_mask = model(
         images,
         tokens,
@@ -164,6 +217,7 @@ def forward_step(data_iterator, model):
         loss_mask,
         image_token_index=unwrapped_model.image_token_index,
         num_image_tiles=num_image_tiles,
+        packed_seq_params=packed_seq_params,
     )
 
     return output_tensor, partial(loss_func, new_loss_mask)
