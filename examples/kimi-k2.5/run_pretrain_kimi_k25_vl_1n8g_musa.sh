@@ -23,10 +23,10 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PATCH_HOME=${PATCH_HOME:-$(cd "${SCRIPT_DIR}/../.." && pwd)}
 MEGATRON_PATH=${MEGATRON_PATH:-${PATCH_HOME}/../Megatron-LM}
-MODEL_CONFIG_DIR=${MODEL_CONFIG_DIR:-${PATCH_HOME}/../kimi-k25-vl}
+MODEL_CONFIG_DIR="/mnt/seed17/001688/cchen/kimi-k25/Kimi-K2.5-tokenizer"
 
-WORK_HOME=${WORK_HOME:-"/home/dist/cchen/src2/tmp"}
-DATA_DIR=${DATA_DIR:-"/home/dist/cchen/data/flickr30k_kimi_debug"}
+WORK_HOME=${WORK_HOME:-"/mnt/seed17/001688/cchen/kimi-k25/tmp"}
+DATA_DIR=${DATA_DIR:-"/mnt/seed17/001688/cchen/kimi-k25/data/flickr30k_kimi_full"}
 EXPNAME=${EXPNAME:-}
 EXTRA_ARGS=()
 
@@ -258,7 +258,7 @@ MOE_AUX_LOSS_COEFF=${CFG_MOE_AUX_LOSS_COEFF}
 MOE_SHARED_EXPERT_INTERMEDIATE_SIZE=${MOE_FFN_HIDDEN_SIZE}
 MOE_TOKEN_DISPATCHER_TYPE=alltoall ## flex
 MOE_ROUTER_DTYPE=fp32
-MOE_GROUPED_GEMM=1
+MOE_GROUPED_GEMM=0
 MOE_PERMUTE_FUSION=1
 MOE_ROUTER_ENABLE_EXPERT_BIAS=$([[ "${CFG_TOPK_METHOD}" == noaux* ]] && echo 1 || echo 0)
 MOE_ROUTER_BIAS_UPDATE_RATE=1e-3
@@ -346,10 +346,11 @@ SAVE_INTERVAL=1000000
 EVAL_INTERVAL=1000000
 EVAL_ITERS=0 # 2
 LOG_INTERVAL=1
+LOGGING_LEVEL=${LOGGING_LEVEL:-30}
 NUM_WORKERS=2
 
 TOKENIZER_MODEL=${MODEL_CONFIG_DIR}
-DATA_DIR=/home/dist/cchen/data/flickr30k_kimi_debug
+DATA_DIR=/mnt/seed17/001688/cchen/kimi-k25/data/flickr30k_kimi_full
 TRAIN_DATA=${DATA_DIR}/train.simple.jsonl
 VALID_DATA=${DATA_DIR}/valid.simple.jsonl
 TEST_DATA=${DATA_DIR}/test.simple.jsonl
@@ -578,6 +579,7 @@ fi
 
 EVAL_AND_LOGGING_ARGS=(
     --log-interval "${LOG_INTERVAL}"
+    --logging-level "${LOGGING_LEVEL}"
     --log-throughput
     --save-interval "${SAVE_INTERVAL}"
     --eval-interval "${EVAL_INTERVAL}"
