@@ -86,7 +86,7 @@ def get_qwen3vl_vision_model_spec(
     is_vit=True
 ) -> ModuleSpec:
     attn_mask_type = AttnMaskType.no_mask # THD full attention
-    norm_cls = LocalSpecProvider().layer_norm()
+    norm_cls = WrappedTorchNorm
     mlp = ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(

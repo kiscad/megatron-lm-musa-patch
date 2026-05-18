@@ -16,6 +16,7 @@
 
 import os
 import sys
+import json
 import logging
 from functools import partial
 from copy import deepcopy
@@ -104,6 +105,22 @@ def model_provider(
 
     # Config of vit, llm and projector
     config = core_transformer_config_from_args(args, Qwen3VLTransformerConfig)
+    if config.normalization == "RMSNorm":
+        config.persist_layer_norm = False
+
+    hf_config_path = os.path.join(args.tokenizer_model, "config.json")
+    if os.path.isfile(hf_config_path):
+        with open(hf_config_path, "r", encoding="utf-8") as f:
+            hf_config = json.load(f)
+        hf_text_config = hf_config.get("text_config", {})
+        hf_vocab_size = hf_text_config.get("vocab_size", hf_config.get("vocab_size"))
+        if hf_vocab_size is not None and args.padded_vocab_size < hf_vocab_size:
+            print_rank_0(
+                f"override padded_vocab_size from {args.padded_vocab_size} "
+                f"to HF config vocab_size {hf_vocab_size}"
+            )
+            args.padded_vocab_size = hf_vocab_size
+
     use_te = args.transformer_impl == "transformer_engine"
     if not use_te:
         raise NotImplementedError("The Qwen3-VL model is only implemented with TransformerEngine!")

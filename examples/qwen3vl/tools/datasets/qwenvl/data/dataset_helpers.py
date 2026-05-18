@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import traceback
+import zipfile
 
 from collections import defaultdict
 from dataclasses import dataclass
@@ -136,6 +137,23 @@ class TaskEncoder(
         self.sequence_parallel = self.args.sequence_parallel
 
         self.tokenizer = get_tokenizer()
+        hf_tokenizer = getattr(self.tokenizer, "_tokenizer", None)
+        if hf_tokenizer is not None:
+            for attr_name in ("apply_chat_template", "encode", "pad_token_id"):
+                if not hasattr(self.tokenizer, attr_name) and hasattr(hf_tokenizer, attr_name):
+                    setattr(self.tokenizer, attr_name, getattr(hf_tokenizer, attr_name))
+            if not hasattr(self.tokenizer, "image_token_id"):
+                self.tokenizer.image_token_id = getattr(
+                    self.args, "image_token_id", hf_tokenizer.convert_tokens_to_ids("<|image_pad|>")
+                )
+            if not hasattr(self.tokenizer, "video_token_id"):
+                self.tokenizer.video_token_id = getattr(
+                    self.args, "video_token_id", hf_tokenizer.convert_tokens_to_ids("<|video_pad|>")
+                )
+        if not hasattr(self.tokenizer, "processor"):
+            self.tokenizer.processor = transformers.AutoProcessor.from_pretrained(
+                self.args.tokenizer_model, trust_remote_code=True
+            )
 
         self.temporal_patch_size = self.args.temporal_patch_size
         self.merge_size = self.args.spatial_merge_size
@@ -145,8 +163,41 @@ class TaskEncoder(
 
         self.vision_root = self.args.vision_root
         assert self.vision_root is not None, "Please give the vision root."
+        self._zip_cache = {}
         # NOTE: Qwen3-VL don't use system prompt by default
         self.use_system_prompt = getattr(self.args, "use_system_prompt", True)
+
+    def _open_image(self, img_path: str):
+        if os.path.isfile(img_path):
+            return PIL.Image.open(img_path)
+
+        rel_path = os.path.relpath(img_path, self.vision_root).lstrip("./")
+        parts = rel_path.split(os.sep)
+        for split_idx in range(len(parts) - 1, 0, -1):
+            archive_dir = os.path.join(self.vision_root, *parts[:split_idx])
+            if not os.path.isdir(archive_dir):
+                continue
+
+            member_name = os.path.join(*parts[split_idx:]).replace(os.sep, "/")
+            for filename in sorted(os.listdir(archive_dir)):
+                if not filename.endswith(".zip"):
+                    continue
+
+                archive_path = os.path.join(archive_dir, filename)
+                zf = self._zip_cache.get(archive_path)
+                if zf is None:
+                    zf = zipfile.ZipFile(archive_path)
+                    self._zip_cache[archive_path] = zf
+
+                try:
+                    with zf.open(member_name) as fp:
+                        image = PIL.Image.open(fp)
+                        image.load()
+                        return image
+                except KeyError:
+                    continue
+
+        return PIL.Image.open(img_path)
 
     def encode_sample(self, sample: Union[VQASample, ChatMLSample]):
         if isinstance(sample, VQASample):
@@ -261,7 +312,7 @@ class TaskEncoder(
             for img in sample.imgs:
                 img_path = os.path.join(self.vision_root, img)
                 try:
-                    image = PIL.Image.open(img_path)
+                    image = self._open_image(img_path)
                     image = self._preprocess_image(
                         image=image,
                         image_max_pixels=getattr(
@@ -293,7 +344,7 @@ class TaskEncoder(
 
         if sample.videos is not None and len(sample.videos) > 0:
             videos = [
-                [PIL.Image.open(os.path.join(self.vision_root, frame)) for frame in video]
+                [self._open_image(os.path.join(self.vision_root, frame)) for frame in video]
                 for video in sample.videos
             ]
             # NOTE: make n_frames even foreach video

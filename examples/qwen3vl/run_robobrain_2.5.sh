@@ -53,6 +53,8 @@ JOB_NAME=${JOB_NAME:-"qwen3_vl"}
 # Create job identifier with timestamp
 JOB_ID="${JOB_NAME}_${TIMESTAMP}"
 
+TRAIN_ITERS=50
+
 # ============================================================
 # 1. Support getting output directory from OUTPUT_DIR environment variable
 # ============================================================

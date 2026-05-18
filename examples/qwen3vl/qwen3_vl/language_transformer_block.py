@@ -41,6 +41,10 @@ except ImportError:
 
 get_cpu_offload_context = None
 te_checkpoint = None
+try:
+    from transformer_engine.pytorch.cpu_offload import get_fine_grained_offload_handler
+except ImportError:
+    get_fine_grained_offload_handler = None
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -295,6 +299,12 @@ class LanguageTransformerBlock(TransformerBlock):
             use_outer_quantization_context = False
             use_inner_quantization_context = False
             outer_quantization_context = nullcontext()
+
+        if get_fine_grained_offload_handler is not None:
+            fine_grained_offload_handler = get_fine_grained_offload_handler()
+            fine_grained_offload_handler.num_layers = len(self.layers)
+            fine_grained_offload_handler.pp_size = self.config.pipeline_model_parallel_size
+            fine_grained_offload_handler.is_pipeline_last_stage = parallel_state.is_pipeline_last_stage()
 
         with rng_context, outer_quantization_context:
             # Forward pass.
