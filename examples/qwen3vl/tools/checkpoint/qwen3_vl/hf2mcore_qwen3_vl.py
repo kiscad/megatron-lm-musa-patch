@@ -28,8 +28,8 @@ from transformers import AutoConfig, AutoTokenizer, Qwen3VLForConditionalGenerat
 path_dir = os.path.abspath(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
 )
-sys.path.append(path_dir)
-sys.path.append(os.path.join(path_dir, "third_party/Megatron-LM"))
+sys.path.insert(0, path_dir)
+sys.path.insert(0, os.path.join(path_dir, "third_party/Megatron-LM"))
 
 from megatron.training import get_args
 from megatron.training.checkpointing import (
@@ -45,7 +45,29 @@ from tools.checkpoint.qwen2_5_vl.utils import (
     save_state_dict,
 )
 
-from flagscale.train.train_qwen3_vl import add_multimodal_extra_args, model_provider
+try:
+    from flagscale.train.train_qwen3_vl import add_multimodal_extra_args, model_provider
+except ModuleNotFoundError:
+    from train_qwen3_vl import add_multimodal_extra_args, model_provider
+
+
+def _patch_musa_current_device():
+    original_current_device = torch.cuda.current_device
+
+    def current_device_as_int():
+        device = original_current_device()
+        if isinstance(device, int):
+            return device
+        if isinstance(device, torch.device):
+            return 0 if device.index is None else device.index
+        if isinstance(device, str):
+            return int(device.rsplit(":", 1)[-1])
+        return int(device)
+
+    torch.cuda.current_device = current_device_as_int
+
+
+_patch_musa_current_device()
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
