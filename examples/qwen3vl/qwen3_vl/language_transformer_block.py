@@ -398,10 +398,10 @@ class LanguageTransformerBlock(TransformerBlock):
         # Gather hidden states from all sequence parallel ranks, becasuse visual_embeds is not sharded.
         if self.config.sequence_parallel:
             hidden_states = gather_from_sequence_parallel_region(hidden_states)
-        # local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
-        # hidden_states[visual_pos_masks, :] = local_this
         local_this = hidden_states[visual_pos_masks, :] + visual_embeds
-        hidden_states = hidden_states.masked_scatter(visual_pos_masks.unsqueeze(-1), local_this)
+        updated_hidden_states = hidden_states.clone()
+        updated_hidden_states[visual_pos_masks, :] = local_this
+        hidden_states = updated_hidden_states
         if self.config.sequence_parallel:
             hidden_states = scatter_to_sequence_parallel_region(hidden_states)
         return hidden_states

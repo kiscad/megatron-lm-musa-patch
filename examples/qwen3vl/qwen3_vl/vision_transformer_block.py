@@ -229,6 +229,10 @@ class VisionTransformerBlock(TransformerBlock):
                             hidden_states.view(-1, merger.config.ffn_hidden_size)
                         )
                     )
+                    deepstack_feature = torch.nan_to_num(
+                        deepstack_feature, nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                    deepstack_feature = torch.clamp(deepstack_feature, min=-10.0, max=10.0)
                     deepstack_feature_lists.append(deepstack_feature)
 
                 if (
@@ -430,6 +434,10 @@ class VisionTransformerBlock(TransformerBlock):
                                 hidden_states.view(-1, merger.config.ffn_hidden_size)
                             )
                         )
+                        deepstack_feature = torch.nan_to_num(
+                            deepstack_feature, nan=0.0, posinf=0.0, neginf=0.0
+                        )
+                        deepstack_feature = torch.clamp(deepstack_feature, min=-10.0, max=10.0)
                         deepstack_feature_lists.append(deepstack_feature)
 
                     if (

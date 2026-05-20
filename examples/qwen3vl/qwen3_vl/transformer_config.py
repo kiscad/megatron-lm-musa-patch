@@ -69,8 +69,13 @@ def get_vision_model_config(args, config):
         config.deepstack_visual_indexes=[8, 16, 24]
 
     config.num_attention_heads = 16 # num_heads
-    config.add_bias_linear = True # all nn.Linear has bias (MLP, attn)
-    config.add_qkv_bias = True # qkv_proj in attn has bias
+    if getattr(args, "pretrained_checkpoint", None):
+        config.add_bias_linear = True # all nn.Linear has bias (MLP, attn)
+        config.add_qkv_bias = True # qkv_proj in attn has bias
+    else:
+        # MUSA/TE random-init path can produce NaNs with vision linear biases enabled.
+        config.add_bias_linear = False
+        config.add_qkv_bias = False
     config.hidden_dropout = 0.0
     config.attention_dropout = 0.0
 

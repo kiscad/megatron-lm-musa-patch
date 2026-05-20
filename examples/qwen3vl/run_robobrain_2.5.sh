@@ -24,7 +24,7 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-7788}
 GPUS_PER_NODE=${GPUS_PER_NODE:-${TQ_GPU_NUM:-8}}
 WORLD_SIZE=${WORLD_SIZE:-${num_nodes:-1}}
-NODE_RANK=${NODE_RANK:-${RANK:-${POD_RANK:-1}}}
+NODE_RANK=${NODE_RANK:-${RANK:-${POD_RANK:-0}}}
 NODE_ADDR=${NODE_ADDR:-$(ip a 2>/dev/null | awk '/inet / && !/127.0.0.1/ {print $2}' | cut -d/ -f1 | head -n 1 || true)}
 NODE_ADDR=${NODE_ADDR:-$(hostname)}
 
@@ -91,28 +91,31 @@ export MUSA_BLOCK_DISTRIBUTION_GRANULARITY=${MUSA_BLOCK_DISTRIBUTION_GRANULARITY
 # Training, model, data, and optimizer defaults
 # -----------------------------------------------------------------------------
 TRAIN_SCRIPT=${TRAIN_SCRIPT:-${SCRIPT_DIR}/train_qwen3_vl.py}
-PRETRAINED_CHECKPOINT=${PRETRAINED_CHECKPOINT:-/mnt/seed17/001688/haoran.huang/Qwen3-VL-8B-Instruct-tp1-pp2}
+PRETRAINED_CHECKPOINT=${PRETRAINED_CHECKPOINT:-/mnt/seed17/001688/cchen/kimi-k25/model/Qwen3-VL-32B-Instruct}
 DATA_PATH=${DATA_PATH:-/mnt/seed17/001688/haoran.huang/OneThinker/wds-1}
 VISION_ROOT=${VISION_ROOT:-/mnt/seed17/001688/haoran.huang/OneThinker}
-TOKENIZER_MODEL=${TOKENIZER_MODEL:-/mnt/seed17/001688/haoran.huang/Qwen3-VL-8B-Instruct-tp2-pp2}
+TOKENIZER_MODEL=${TOKENIZER_MODEL:-/mnt/seed17/001688/cchen/kimi-k25/model/Qwen3-VL-32B-Instruct}
 DATALOADER_SAVE_DIR=${DATALOADER_SAVE_DIR:-${CHECKPOINT_SAVE_DIR}/dataloader}
 
-TP_SIZE=${TP_SIZE:-1}
-PP_SIZE=${PP_SIZE:-2}
+TP_SIZE=${TP_SIZE:-2}
+PP_SIZE=${PP_SIZE:-1}
 CP_SIZE=${CP_SIZE:-1}
 
 VISION_RATION=${VISION_RATION:-0.1}
 NUM_WORKERS=${NUM_WORKERS:-1}
 KV_CHANNELS=${KV_CHANNELS:-128}
-NUM_LAYERS=${NUM_LAYERS:-36}
-DECODER_FIRST_PIPELINE_NUM_LAYERS=${DECODER_FIRST_PIPELINE_NUM_LAYERS:-16}
-HIDDEN_SIZE=${HIDDEN_SIZE:-4096}
-FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-12288}
-NUM_ATTENTION_HEADS=${NUM_ATTENTION_HEADS:-32}
+NUM_LAYERS=${NUM_LAYERS:-16}
+DECODER_FIRST_PIPELINE_NUM_LAYERS=${DECODER_FIRST_PIPELINE_NUM_LAYERS:-}
+if [[ -z "${DECODER_FIRST_PIPELINE_NUM_LAYERS}" && "${PP_SIZE}" -gt 1 ]]; then
+    DECODER_FIRST_PIPELINE_NUM_LAYERS=$((NUM_LAYERS / PP_SIZE))
+fi
+HIDDEN_SIZE=${HIDDEN_SIZE:-5120}
+FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-25600}
+NUM_ATTENTION_HEADS=${NUM_ATTENTION_HEADS:-64}
 NUM_QUERY_GROUPS=${NUM_QUERY_GROUPS:-8}
 SEQ_LENGTH=${SEQ_LENGTH:-${SEQ_LEN:-4096}}
 MAX_PADDING_LENGTH=${MAX_PADDING_LENGTH:-4096}
-MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS:-4096}
+MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS:-262144}
 NORM_EPSILON=${NORM_EPSILON:-1e-06}
 INIT_METHOD_STD=${INIT_METHOD_STD:-0.02}
 ATTENTION_DROPOUT=${ATTENTION_DROPOUT:-0.0}
@@ -259,9 +262,19 @@ LOGGING_ARGS=(
     --wandb-save-dir "${WANDB_DIR}"
 )
 
+PRETRAINED_CHECKPOINT_ARGS=()
+if [[ -n "${PRETRAINED_CHECKPOINT}" ]]; then
+    if [[ -f "${PRETRAINED_CHECKPOINT}/latest_checkpointed_iteration.txt" ]]; then
+        PRETRAINED_CHECKPOINT_ARGS=(--pretrained-checkpoint "${PRETRAINED_CHECKPOINT}")
+    else
+        echo "WARNING: PRETRAINED_CHECKPOINT=${PRETRAINED_CHECKPOINT} is not a Megatron checkpoint; skipping --pretrained-checkpoint."
+        echo "         Use a converted Megatron checkpoint directory here to initialize from pretrained weights."
+    fi
+fi
+
 CHECKPOINT_ARGS=(
     --save-interval "${SAVE_INTERVAL}"
-    --pretrained-checkpoint "${PRETRAINED_CHECKPOINT}"
+    "${PRETRAINED_CHECKPOINT_ARGS[@]}"
     --dataloader-save "${DATALOADER_SAVE_DIR}"
     --ckpt-format torch
     --save "${CHECKPOINT_SAVE_DIR}"
@@ -276,7 +289,6 @@ MODEL_ARGS=(
     --attention-backend flash
     --disable-bias-linear
     --num-layers "${NUM_LAYERS}"
-    --decoder-first-pipeline-num-layers "${DECODER_FIRST_PIPELINE_NUM_LAYERS}"
     --hidden-size "${HIDDEN_SIZE}"
     --ffn-hidden-size "${FFN_HIDDEN_SIZE}"
     --num-attention-heads "${NUM_ATTENTION_HEADS}"
@@ -299,6 +311,9 @@ MODEL_ARGS=(
     --rotary-seq-len-interpolation-factor "${ROTARY_SEQ_LEN_INTERPOLATION_FACTOR}"
     --mrope-section 24 20 20
 )
+if [[ "${PP_SIZE}" -gt 1 && -n "${DECODER_FIRST_PIPELINE_NUM_LAYERS}" ]]; then
+    MODEL_ARGS+=(--decoder-first-pipeline-num-layers "${DECODER_FIRST_PIPELINE_NUM_LAYERS}")
+fi
 
 VISION_ARGS=(
     --patch-size "${PATCH_SIZE}"

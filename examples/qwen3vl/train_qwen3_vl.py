@@ -182,6 +182,28 @@ def model_provider(
         freeze_vision_projection=False
     )
 
+    # Keep random-init runs finite; checkpoint loading later overwrites these values.
+    if model.vision_model is not None:
+        with torch.no_grad():
+            for name, param in model.vision_model.named_parameters():
+                if name.endswith("bias"):
+                    param.zero_()
+                elif "deepstack_norm_list" in name and name.endswith("weight"):
+                    param.fill_(1.0)
+                elif "deepstack_merger_list" in name:
+                    if param.dim() > 1:
+                        torch.nn.init.normal_(param, mean=0.0, std=args.init_method_std)
+                    else:
+                        param.zero_()
+
+    if model.language_model is not None:
+        with torch.no_grad():
+            for name, param in model.language_model.named_parameters():
+                if "layernorm" in name and name.endswith("weight"):
+                    param.fill_(1.0)
+                elif "layernorm" in name and name.endswith("bias"):
+                    param.zero_()
+
     # def forward_output(name):
     #     def forward_hook(module, input, output):
     #         print(f"Inside {module.__class__.__name__} forward hook")
@@ -631,6 +653,14 @@ def get_batch(data_iterator, model: Qwen3VLModel = None) -> Tuple:
 
     torch.cuda.nvtx.range_push("index tokens")
     tokenizer = get_tokenizer()
+    hf_tokenizer = getattr(tokenizer, "_tokenizer", None)
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is None and hf_tokenizer is not None:
+        pad_token_id = getattr(hf_tokenizer, "pad_token_id", None)
+    if pad_token_id is None:
+        pad_token_id = getattr(tokenizer, "pad", None)
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eod
 
     tokens = data_text.long().contiguous()
     labels = target.contiguous()
@@ -641,7 +671,7 @@ def get_batch(data_iterator, model: Qwen3VLModel = None) -> Tuple:
     # NOTE: no sequence packing in LLM inputs
     torch.cuda.nvtx.range_push("get_ltor_masks_and_position_ids")
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens, image_thw_grids, video_thw_grids, labels, pad_token=tokenizer.pad_token_id, second_per_grid_ts=second_per_grid_ts, ignore_index=IGNORE_IDX, model=model,
+        tokens, image_thw_grids, video_thw_grids, labels, pad_token=pad_token_id, second_per_grid_ts=second_per_grid_ts, ignore_index=IGNORE_IDX, model=model,
     )
     torch.cuda.nvtx.range_pop()
 
@@ -687,7 +717,9 @@ def loss_func(
     losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
     # print(losses, loss_mask)
-    loss = torch.sum(losses * loss_mask)
+    # Avoid NaN propagation from masked tokens: 0 * NaN is still NaN.
+    masked_losses = torch.where(loss_mask > 0, losses, torch.zeros_like(losses))
+    loss = torch.sum(masked_losses * loss_mask)
     # loss = torch.sum(losses)
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
