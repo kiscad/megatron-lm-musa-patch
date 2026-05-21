@@ -88,23 +88,69 @@ export MUSA_BLOCK_SCHEDULE_MODE=${MUSA_BLOCK_SCHEDULE_MODE:-1}
 export MUSA_BLOCK_DISTRIBUTION_GRANULARITY=${MUSA_BLOCK_DISTRIBUTION_GRANULARITY:-0}
 
 # -----------------------------------------------------------------------------
+# Python dependency checks
+# -----------------------------------------------------------------------------
+PYTHON_BIN=${PYTHON_BIN:-python}
+FLAGSCALE_HOME=${FLAGSCALE_HOME:-/mnt/seed17/001688/haoran.huang/FlagScale}
+PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+AUTO_INSTALL_ENERGON_DEPS=${AUTO_INSTALL_ENERGON_DEPS:-1}
+
+ensure_energon_dependencies() {
+    if "${PYTHON_BIN}" -c "import megatron.energon" >/dev/null 2>&1; then
+        echo "Megatron-Energon dependency check passed."
+        return 0
+    fi
+
+    if [[ "${AUTO_INSTALL_ENERGON_DEPS}" != "1" ]]; then
+        echo "Megatron-Energon is missing. Set AUTO_INSTALL_ENERGON_DEPS=1 or install it manually." >&2
+        return 1
+    fi
+
+    local requirements_file="${FLAGSCALE_HOME}/requirements/requirements-base.txt"
+    local energon_dir="${FLAGSCALE_HOME}/third_party/Megatron-Energon"
+    if [[ ! -f "${requirements_file}" ]]; then
+        echo "Requirements file not found: ${requirements_file}" >&2
+        return 1
+    fi
+    if [[ ! -d "${energon_dir}" ]]; then
+        echo "Megatron-Energon directory not found: ${energon_dir}" >&2
+        return 1
+    fi
+
+    echo "Megatron-Energon is missing; installing dependencies on node ${NODE_RANK} (${NODE_ADDR})..."
+    (
+        cd "${FLAGSCALE_HOME}"
+        "${PYTHON_BIN}" -m pip install -r requirements/requirements-base.txt -i "${PIP_INDEX_URL}"
+    )
+    (
+        cd "${energon_dir}"
+        "${PYTHON_BIN}" -m pip install -e . -i "${PIP_INDEX_URL}"
+    )
+
+    "${PYTHON_BIN}" -c "import megatron.energon"
+    echo "Megatron-Energon installed successfully."
+}
+
+ensure_energon_dependencies
+
+# -----------------------------------------------------------------------------
 # Training, model, data, and optimizer defaults
 # -----------------------------------------------------------------------------
 TRAIN_SCRIPT=${TRAIN_SCRIPT:-${SCRIPT_DIR}/train_qwen3_vl.py}
-PRETRAINED_CHECKPOINT=${PRETRAINED_CHECKPOINT:-/mnt/seed17/001688/cchen/kimi-k25/model/Qwen3-VL-32B-Instruct}
+PRETRAINED_CHECKPOINT=${PRETRAINED_CHECKPOINT:-/mnt/seed17/001688/cchen/kimi-k25/model/qwen3vl-32b-mcore-tp4-pp8}
 DATA_PATH=${DATA_PATH:-/mnt/seed17/001688/haoran.huang/OneThinker/wds-1}
 VISION_ROOT=${VISION_ROOT:-/mnt/seed17/001688/haoran.huang/OneThinker}
-TOKENIZER_MODEL=${TOKENIZER_MODEL:-/mnt/seed17/001688/cchen/kimi-k25/model/Qwen3-VL-32B-Instruct}
+TOKENIZER_MODEL=${TOKENIZER_MODEL:-/mnt/seed17/001688/cchen/kimi-k25/model/qwen3vl-32b-mcore-tp4-pp8}
 DATALOADER_SAVE_DIR=${DATALOADER_SAVE_DIR:-${CHECKPOINT_SAVE_DIR}/dataloader}
 
-TP_SIZE=${TP_SIZE:-2}
-PP_SIZE=${PP_SIZE:-1}
+TP_SIZE=${TP_SIZE:-4}
+PP_SIZE=${PP_SIZE:-8}
 CP_SIZE=${CP_SIZE:-1}
 
 VISION_RATION=${VISION_RATION:-0.1}
 NUM_WORKERS=${NUM_WORKERS:-1}
 KV_CHANNELS=${KV_CHANNELS:-128}
-NUM_LAYERS=${NUM_LAYERS:-16}
+NUM_LAYERS=${NUM_LAYERS:-64}
 DECODER_FIRST_PIPELINE_NUM_LAYERS=${DECODER_FIRST_PIPELINE_NUM_LAYERS:-}
 if [[ -z "${DECODER_FIRST_PIPELINE_NUM_LAYERS}" && "${PP_SIZE}" -gt 1 ]]; then
     DECODER_FIRST_PIPELINE_NUM_LAYERS=$((NUM_LAYERS / PP_SIZE))
@@ -124,9 +170,10 @@ ROTARY_PERCENT=${ROTARY_PERCENT:-1.0}
 ROTARY_BASE=${ROTARY_BASE:-5000000}
 ROTARY_SEQ_LEN_INTERPOLATION_FACTOR=${ROTARY_SEQ_LEN_INTERPOLATION_FACTOR:-1}
 PATCH_SIZE=${PATCH_SIZE:-16}
+MAKE_VOCAB_SIZE_DIVISIBLE_BY=${MAKE_VOCAB_SIZE_DIVISIBLE_BY:-1}
 EXTRA_VOCAB_SIZE=${EXTRA_VOCAB_SIZE:-293}
 
-TRAIN_ITERS=${TRAIN_ITERS:-50}
+TRAIN_ITERS=${TRAIN_ITERS:-5}
 EXIT_INTERVAL=${EXIT_INTERVAL:-6000}
 EVAL_ITERS=${EVAL_ITERS:-0}
 SAVE_INTERVAL=${SAVE_INTERVAL:-2000}
@@ -354,6 +401,7 @@ DATA_ARGS=(
 TOKENIZER_ARGS=(
     --tokenizer-type HuggingFaceTokenizer
     --tokenizer-model "${TOKENIZER_MODEL}"
+    --make-vocab-size-divisible-by "${MAKE_VOCAB_SIZE_DIVISIBLE_BY}"
     --extra-vocab-size "${EXTRA_VOCAB_SIZE}"
 )
 
