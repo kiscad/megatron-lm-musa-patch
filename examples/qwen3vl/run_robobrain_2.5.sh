@@ -137,13 +137,13 @@ ensure_energon_dependencies
 # Training, model, data, and optimizer defaults
 # -----------------------------------------------------------------------------
 TRAIN_SCRIPT=${TRAIN_SCRIPT:-${SCRIPT_DIR}/train_qwen3_vl.py}
-PRETRAINED_CHECKPOINT=${PRETRAINED_CHECKPOINT:-/mnt/seed17/001688/cchen/kimi-k25/model/qwen3vl-32b-mcore-tp4-pp8}
+PRETRAINED_CHECKPOINT=${PRETRAINED_CHECKPOINT:-/mnt/seed17/001688/cchen/kimi-k25/model/qwen3vl-32b-mcore-tp2-pp8}
 DATA_PATH=${DATA_PATH:-/mnt/seed17/001688/haoran.huang/OneThinker/wds-1}
 VISION_ROOT=${VISION_ROOT:-/mnt/seed17/001688/haoran.huang/OneThinker}
-TOKENIZER_MODEL=${TOKENIZER_MODEL:-/mnt/seed17/001688/cchen/kimi-k25/model/qwen3vl-32b-mcore-tp4-pp8}
+TOKENIZER_MODEL=${TOKENIZER_MODEL:-/mnt/seed17/001688/cchen/kimi-k25/model/qwen3vl-32b-mcore-tp2-pp8}
 DATALOADER_SAVE_DIR=${DATALOADER_SAVE_DIR:-${CHECKPOINT_SAVE_DIR}/dataloader}
 
-TP_SIZE=${TP_SIZE:-4}
+TP_SIZE=${TP_SIZE:-2}
 PP_SIZE=${PP_SIZE:-8}
 CP_SIZE=${CP_SIZE:-1}
 
