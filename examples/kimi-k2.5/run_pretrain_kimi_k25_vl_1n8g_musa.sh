@@ -336,10 +336,16 @@ fi
 # -----------------------------------------------------------------------------
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-32}
-TRAIN_ITERS=${TRAIN_ITERS:-50}
+TRAIN_ITERS=${TRAIN_ITERS:-2000}
 TRAIN_SAMPLES=${TRAIN_SAMPLES:-}
 SEED=${SEED:-42}
 INIT_METHOD_STD=${INIT_METHOD_STD:-${CFG_INIT_METHOD_STD}}
+DETERMINISTIC_MODE=${DETERMINISTIC_MODE:-1}
+if [[ "${DETERMINISTIC_MODE}" == "1" ]]; then
+    USE_FLASH_ATTN=${USE_FLASH_ATTN:-0}
+else
+    USE_FLASH_ATTN=${USE_FLASH_ATTN:-1}
+fi
 
 LR=${LR:-2.0e-4}
 MIN_LR=${MIN_LR:-2.0e-5}
@@ -362,6 +368,18 @@ fi
 if (( LR_WARMUP_ITERS >= LR_DECAY_ITERS )); then
     echo "LR_WARMUP_ITERS=${LR_WARMUP_ITERS} must be < LR_DECAY_ITERS=${LR_DECAY_ITERS}."
     exit 1
+fi
+if [[ "${DETERMINISTIC_MODE}" == "1" && "${USE_FLASH_ATTN}" == "1" ]]; then
+    echo "DETERMINISTIC_MODE=1 is incompatible with USE_FLASH_ATTN=1 because Megatron marks flash attention as non-deterministic."
+    exit 1
+fi
+
+# Determinism controls for loss-curve alignment runs.
+export PYTHONHASHSEED=${PYTHONHASHSEED:-${SEED}}
+if [[ "${DETERMINISTIC_MODE}" == "1" ]]; then
+    export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:4096:8}
+    export NCCL_ALGO=${NCCL_ALGO:-Ring}
+    export NVTE_ALLOW_NONDETERMINISTIC_ALGO=${NVTE_ALLOW_NONDETERMINISTIC_ALGO:-0}
 fi
 
 # -----------------------------------------------------------------------------
@@ -549,7 +567,6 @@ TRAINING_ARGS=(
     --init-method-std "${INIT_METHOD_STD}"
     --use-mcore-models
     --use-distributed-optimizer
-    --use-flash-attn
     --enable-experimental
     --distributed-backend nccl
     --recompute-granularity full
@@ -559,6 +576,13 @@ TRAINING_ARGS=(
     --no-bias-dropout-fusion
     --no-bias-swiglu-fusion
 )
+
+if [[ "${USE_FLASH_ATTN}" == "1" ]]; then
+    TRAINING_ARGS+=(--use-flash-attn)
+fi
+if [[ "${DETERMINISTIC_MODE}" == "1" ]]; then
+    TRAINING_ARGS+=(--deterministic-mode --no-rope-fusion)
+fi
 
 if [[ "${USE_THD_ATTENTION}" == "1" ]]; then
     TRAINING_ARGS+=(--use-thd-attention)
