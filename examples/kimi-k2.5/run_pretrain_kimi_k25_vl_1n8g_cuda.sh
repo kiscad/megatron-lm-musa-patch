@@ -1,16 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-# Kimi-K2.5-VL pretraining entry.
+# Kimi-K2.5-VL pretraining entry for CUDA/NCCL.
 #
 # Usage:
 #   WORK_HOME=/path/to/work DATA_DIR=/path/to/jsonl_dir \
-#     bash run_pretrain_kimi_k25_vl_1n8g_musa.sh
+#     bash run_pretrain_kimi_k25_vl_1n8g_cuda.sh
 #
 # Positional fallback:
-#   bash run_pretrain_kimi_k25_vl_1n8g_musa.sh [WORK_HOME] [DATA_DIR] [EXPNAME] [extra Megatron args...]
+#   bash run_pretrain_kimi_k25_vl_1n8g_cuda.sh [WORK_HOME] [DATA_DIR] [EXPNAME] [extra Megatron args...]
 # Env-style extra Megatron args:
-#   WORK_HOME=... TRAIN_DATA=... bash run_pretrain_kimi_k25_vl_1n8g_musa.sh -- --load /ckpt
+#   WORK_HOME=... TRAIN_DATA=... bash run_pretrain_kimi_k25_vl_1n8g_cuda.sh -- --load /ckpt
 #
 # DATA_DIR defaults to the local Flickr30k debug set and expects
 # train.simple.jsonl / valid.simple.jsonl / test.simple.jsonl. TRAIN_DATA,
@@ -30,7 +30,7 @@ MEGATRON_PATH=${MEGATRON_PATH:-${PATCH_HOME}/../Megatron-LM}
 DEFAULT_MODEL_CONFIG_DIR="/data02/sam.chen/kimi-k25/Kimi-K2.5-tokenizer"
 DEFAULT_WORK_HOME="/data02/sam.chen/kimi-k25/tmp"
 DEFAULT_DATA_DIR="/data02/sam.chen/kimi-k25/data/flickr30k_kimi_full"
-DEFAULT_EXPNAME="kimi_k25_vl_1n8g"
+DEFAULT_EXPNAME="kimi_k25_vl_1n8g_cuda"
 
 MODEL_CONFIG_DIR=${MODEL_CONFIG_DIR:-${DEFAULT_MODEL_CONFIG_DIR}}
 WORK_HOME=${WORK_HOME:-}
@@ -150,49 +150,31 @@ PY
 )"
 
 # -----------------------------------------------------------------------------
-# MUSA/MCCL runtime environment
+# CUDA/NCCL runtime environment
 # -----------------------------------------------------------------------------
 export ENABLE_PROFILER=${ENABLE_PROFILER:-0}
 export PROFILER_FREQ=${PROFILER_FREQ:-4}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
-export MUSA_VISIBLE_DEVICES=${MUSA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
-export MUSA_KERNEL_TIMEOUT=${MUSA_KERNEL_TIMEOUT:-3200000}
-export ACCELERATOR_BACKEND=${ACCELERATOR_BACKEND:-musa}
-
-export MCCL_PROTOS=${MCCL_PROTOS:-2}
-export MCCL_CHECK_POINTERS=${MCCL_CHECK_POINTERS:-0}
-export MCCL_ALGOS=${MCCL_ALGOS:-1}
-export MCCL_BUFFSIZE=${MCCL_BUFFSIZE:-20971520}
-export MCCL_IB_GID_INDEX=${MCCL_IB_GID_INDEX:-3}
-export MCCL_NET_SHARED_BUFFERS=${MCCL_NET_SHARED_BUFFERS:-0}
-export MCCL_IB_TC=${MCCL_IB_TC:-136}
-export MCCL_IB_QPS_PER_CONNECTION=${MCCL_IB_QPS_PER_CONNECTION:-16}
-export MCCL_CROSS_NIC=${MCCL_CROSS_NIC:-0}
-export MCCL_IB_TIMEOUT=${MCCL_IB_TIMEOUT:-20}
-export MCCL_IB_RETRY_CNT=${MCCL_IB_RETRY_CNT:-7}
-
-export MUSA_BLOCK_SCHEDULE_MODE=${MUSA_BLOCK_SCHEDULE_MODE:-1}
-export MUSA_PRINT_ENV=${MUSA_PRINT_ENV:-1}
-export MUSA_BLOCK_DISTRIBUTION_GRANULARITY=${MUSA_BLOCK_DISTRIBUTION_GRANULARITY:-0}
-export MUSA_LOG=${MUSA_LOG:-0x1}
-export MUSA_EXECUTION_TIMEOUT=${MUSA_EXECUTION_TIMEOUT:-480000}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+export ACCELERATOR_BACKEND=${ACCELERATOR_BACKEND:-cuda}
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 export USE_RECOMPUTE_VARIANCE=${USE_RECOMPUTE_VARIANCE:-0}
 export ENABLE_D2H_IN_PERMUTATION=${ENABLE_D2H_IN_PERMUTATION:-0}
 export NO_LOSS_REDUCE=${NO_LOSS_REDUCE:-0}
-export USE_MUSA_MOE=${USE_MUSA_MOE:-1}
-# export USE_DEEPEP_ACE=${USE_DEEPEP_ACE:-0}
+export USE_MUSA_MOE=${USE_MUSA_MOE:-0}
 
-export PYTORCH_MUSA_ALLOC_CONF=${PYTORCH_MUSA_ALLOC_CONF:-expandable_segments:True}
-export TORCH_MCCL_AVOID_RECORD_STREAMS=${TORCH_MCCL_AVOID_RECORD_STREAMS:-1}
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+export NCCL_DEBUG=${NCCL_DEBUG:-WARN}
+export NCCL_ALGO=${NCCL_ALGO:-Ring}
+export NCCL_AVOID_RECORD_STREAMS=${NCCL_AVOID_RECORD_STREAMS:-0}
 
-export PATH=/usr/local/musa/bin:/usr/local/musa/mudnn/bin:/usr/local/musa/mudnn_bench/bin:/usr/local/musa/mccl_test:/usr/local/openmpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-export LD_LIBRARY_PATH="/usr/local/musa/lib:/usr/lib/x86_64-linux-gnu:/usr/local/openmpi/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export PYTHONPATH="${MEGATRON_PATH}:${PATCH_HOME}${PYTHONPATH:+:${PYTHONPATH}}"
 
 unset MLFLOW_TRACKING_URI
 unset MCCL_IB_HCA
+unset TORCH_MCCL_AVOID_RECORD_STREAMS
+unset PYTORCH_MUSA_ALLOC_CONF
 
 # -----------------------------------------------------------------------------
 # Megatron extension build
@@ -341,11 +323,8 @@ TRAIN_SAMPLES=${TRAIN_SAMPLES:-}
 SEED=${SEED:-42}
 INIT_METHOD_STD=${INIT_METHOD_STD:-${CFG_INIT_METHOD_STD}}
 DETERMINISTIC_MODE=${DETERMINISTIC_MODE:-1}
-if [[ "${DETERMINISTIC_MODE}" == "1" ]]; then
-    USE_FLASH_ATTN=${USE_FLASH_ATTN:-0}
-else
-    USE_FLASH_ATTN=${USE_FLASH_ATTN:-1}
-fi
+USE_FLASH_ATTN=${USE_FLASH_ATTN:-0}
+DISABLE_ROPE_FUSION=${DISABLE_ROPE_FUSION:-1}
 
 LR=${LR:-2.0e-4}
 MIN_LR=${MIN_LR:-2.0e-5}
@@ -391,6 +370,8 @@ EVAL_ITERS=${EVAL_ITERS:-0}
 LOG_INTERVAL=${LOG_INTERVAL:-1}
 LOGGING_LEVEL=${LOGGING_LEVEL:-30}
 NUM_WORKERS=${NUM_WORKERS:-2}
+DISTRIBUTED_TIMEOUT_MINUTES=${DISTRIBUTED_TIMEOUT_MINUTES:-120}
+DISABLE_CHECKPOINT_SAVE=${DISABLE_CHECKPOINT_SAVE:-0}
 
 TOKENIZER_MODEL=${TOKENIZER_MODEL:-${MODEL_CONFIG_DIR}}
 TRAIN_DATA=${TRAIN_DATA:-${DATA_DIR:+${DATA_DIR}/train.simple.jsonl}}
@@ -575,13 +556,17 @@ TRAINING_ARGS=(
     --no-gradient-accumulation-fusion
     --no-bias-dropout-fusion
     --no-bias-swiglu-fusion
+    --distributed-timeout-minutes "${DISTRIBUTED_TIMEOUT_MINUTES}"
 )
 
 if [[ "${USE_FLASH_ATTN}" == "1" ]]; then
     TRAINING_ARGS+=(--use-flash-attn)
 fi
 if [[ "${DETERMINISTIC_MODE}" == "1" ]]; then
-    TRAINING_ARGS+=(--deterministic-mode --no-rope-fusion)
+    TRAINING_ARGS+=(--deterministic-mode)
+fi
+if [[ "${DISABLE_ROPE_FUSION}" == "1" ]]; then
+    TRAINING_ARGS+=(--no-rope-fusion)
 fi
 
 if [[ "${USE_THD_ATTENTION}" == "1" ]]; then
@@ -637,10 +622,13 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval "${SAVE_INTERVAL}"
     --eval-interval "${EVAL_INTERVAL}"
     --eval-iters "${EVAL_ITERS}"
-    --save "${CHECKPOINT_PATH}"
     --load "${LOAD_PATH}"
     --tensorboard-dir "${TB_PATH}"
 )
+
+if [[ "${DISABLE_CHECKPOINT_SAVE}" != "1" ]]; then
+    EVAL_AND_LOGGING_ARGS+=(--save "${CHECKPOINT_PATH}")
+fi
 
 CMD=(
     torchrun
@@ -662,13 +650,13 @@ CMD=(
     "${EXTRA_ARGS[@]}"
 )
 
-printf '%q ' "${CMD[@]}" | tee "${LOG_PATH}/pretrain_kimi_k25_vl_1n8g.cmd"
-printf '\n' | tee -a "${LOG_PATH}/pretrain_kimi_k25_vl_1n8g.cmd"
+printf '%q ' "${CMD[@]}" | tee "${LOG_PATH}/pretrain_kimi_k25_vl_1n8g_cuda.cmd"
+printf '\n' | tee -a "${LOG_PATH}/pretrain_kimi_k25_vl_1n8g_cuda.cmd"
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
     exit 0
 fi
 set +e
-"${CMD[@]}" 2>&1 | tee "${LOG_PATH}/pretrain_kimi_k25_vl_1n8g.log"
+"${CMD[@]}" 2>&1 | tee "${LOG_PATH}/pretrain_kimi_k25_vl_1n8g_cuda.log"
 status=${PIPESTATUS[0]}
 set -e
 
@@ -677,7 +665,7 @@ if (( status != 0 )); then
         echo
         echo "torchrun failed with exit code ${status}."
         echo "Recent rank stderr logs under ${TORCHRUN_LOG_PATH}:"
-    } | tee -a "${LOG_PATH}/pretrain_kimi_k25_vl_1n8g.log"
+    } | tee -a "${LOG_PATH}/pretrain_kimi_k25_vl_1n8g_cuda.log"
 
     mapfile -t rank_stderr_logs < <(
         find "${TORCHRUN_LOG_PATH}" -path '*/attempt_*/*/stderr.log' -type f -printf '%T@ %p\n' 2>/dev/null \
@@ -692,7 +680,7 @@ if (( status != 0 )); then
             echo
             echo "===== tail -120 ${rank_stderr_log}"
             tail -120 "${rank_stderr_log}"
-        } | tee -a "${LOG_PATH}/pretrain_kimi_k25_vl_1n8g.log"
+        } | tee -a "${LOG_PATH}/pretrain_kimi_k25_vl_1n8g_cuda.log"
     done
 fi
 

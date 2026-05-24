@@ -7,7 +7,8 @@ import torch
 from megatron.core import parallel_state
 import megatron.core.transformer.moe.moe_utils
 get_capacity = megatron.core.transformer.moe.moe_utils.get_capacity
-device_limited_topk = megatron.core.transformer.moe.moe_utils.device_limited_topk
+device_limited_topk = getattr(megatron.core.transformer.moe.moe_utils, "device_limited_topk", None)
+group_limited_topk = megatron.core.transformer.moe.moe_utils.group_limited_topk
 
 
 def node_limited_topk(
@@ -111,7 +112,7 @@ def sequence_load_balancing_loss_func(
     seq_aux_loss = (cost_coeff * probs_for_aux_loss.mean(dim=0)).sum(dim=1).mean()
     seq_aux_loss *= moe_aux_loss_coeff
 
-    if moe_device_level_aux_loss_coeff is not None:
+    if moe_device_level_aux_loss_coeff:
         num_group = (
         parallel_state.get_expert_model_parallel_world_size()
         )  # num_group equals to expert parallel size
@@ -119,7 +120,7 @@ def sequence_load_balancing_loss_func(
                            probs_for_aux_loss.mean(dim=0).view(batch_size, num_group, -1).sum(dim=2)).sum(dim=1).mean()
         device_aux_loss *= moe_device_level_aux_loss_coeff
         seq_aux_loss += device_aux_loss
-    if moe_comm_aux_loss_coeff is not None:
+    if moe_comm_aux_loss_coeff:
         num_group = (
         parallel_state.get_expert_model_parallel_world_size()
         )  # num_group equals to expert parallel size
@@ -147,133 +148,114 @@ def topk_softmax_with_capacity(
     num_node_group: int = None,
     e_score_correction_bias: torch.Tensor = None,
     deterministic_mode: bool = False,
+    num_groups: Optional[int] = None,
+    group_topk: Optional[int] = None,
+    scaling_factor: Optional[float] = None,
+    score_function: str = "softmax",
+    expert_bias: Optional[torch.Tensor] = None,
 ):
-    """Apply capacity and padding to the top-k selection.
-    Args:
-        logits (torch.Tensor): Logits tensor.
-        topk (int): The number of experts to select for each token.
-        capacity_factor (int): The capacity factor of each expert. Will drop tokens if the number
-                               of tokens exceeds the capacity.
-        pad_to_capacity (bool): Whether to need padding in token drop mode.
-        drop_policy (str): The policy to drop tokens. Can be either "prob" or "position".
-                           If "prob", the tokens with the lowest probabilities will be dropped.
-                           If "position", tokens at the end of each batch will be dropped.
-        use_pre_softmax (bool): Whether to apply softmax before top-k selection.
-        moe_router_topk_limited_devices (int): Number of expert parallel ranks to consider for
-            each token during routing. None means no device limitation.
-        moe_router_topk_scaling_factor (float): Scaling factor for routing score in top-k
-            selection, only works when use_pre_softmax enabled.
-        deterministic_mode (bool): Deprecated.
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
-              the routing probabilities for each token to each expert.
-            - routing_map (torch.Tensor): A mask tensor of shape [num_tokens, num_experts]
-              indicating which experts were selected for each token. True values represent
-              the selected experts.
-            - tokens_per_expert (torch.Tensor): A tensor of shape [num_experts] containing
-              the number of local tokens assigned to each expert before dropping and padding.
-    """
+    """Apply top-k routing with compatibility for old and current Megatron args."""
+
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
-    num_tokens = logits.shape[0]
-    num_experts = logits.shape[1]
-    if use_pre_softmax:
-        # Pre softmax
-        if use_sigmoid:
-            scores = torch.sigmoid(logits).type_as(logits)
-        else:
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+    num_tokens, num_experts = logits.shape
 
-        if e_score_correction_bias is not None:
-            scores_gate = scores + e_score_correction_bias.unsqueeze(0)  #correction only used in router not in multiplied ffn output
-        else:
-            scores_gate = scores
+    if scaling_factor is None:
+        scaling_factor = moe_router_topk_scaling_factor
+    if expert_bias is None:
+        expert_bias = e_score_correction_bias
+    if use_sigmoid:
+        score_function = "sigmoid"
 
+    def compute_topk(scores: torch.Tensor):
+        if group_topk:
+            return group_limited_topk(
+                scores=scores,
+                topk=topk,
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                num_groups=num_groups,
+                group_topk=group_topk,
+            )
         if moe_router_topk_limited_devices:
             if num_node_group:
                 top_indices = node_limited_topk(
-                    scores_gate, topk, num_tokens, num_experts, moe_router_topk_limited_devices, num_node_group
+                    scores,
+                    topk,
+                    num_tokens,
+                    num_experts,
+                    moe_router_topk_limited_devices,
+                    num_node_group,
                 )
-                probs = scores.gather(1, top_indices)
-            else:
-                probs, top_indices = device_limited_topk(
+                return scores.gather(1, top_indices), top_indices
+            if device_limited_topk is not None:
+                return device_limited_topk(
                     scores, topk, num_tokens, num_experts, moe_router_topk_limited_devices
                 )
-        else:
-            probs, top_indices = torch.topk(scores, k=topk, dim=1)
+            return group_limited_topk(
+                scores=scores,
+                topk=topk,
+                num_tokens=num_tokens,
+                num_experts=num_experts,
+                num_groups=parallel_state.get_expert_model_parallel_world_size(),
+                group_topk=moe_router_topk_limited_devices,
+            )
+        return torch.topk(scores, k=topk, dim=1)
 
-        # Normalize the probs.
-        if norm_topk_prob:
-            assert use_sigmoid, f"norm_topk_prob only work with use_sigmoid=True, but get {use_sigmoid}"
-            denominator = probs.sum(dim=-1, keepdim=True) + 1e-20
-            probs = probs / denominator
-        if moe_router_topk_scaling_factor:
-            probs = probs * moe_router_topk_scaling_factor
+    if score_function == "softmax":
+        if use_pre_softmax:
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+            probs, top_indices = compute_topk(scores)
+        else:
+            scores, top_indices = compute_topk(logits)
+            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
+    elif score_function == "sigmoid":
+        scores = torch.sigmoid(logits.float()).type_as(logits)
+        if expert_bias is not None:
+            _, top_indices = compute_topk(scores + expert_bias)
+            probs = scores.gather(1, top_indices)
+        else:
+            probs, top_indices = compute_topk(scores)
+        if norm_topk_prob or topk > 1:
+            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
     else:
-        # Post softmax
-        if topk == 1:
-            # Requires applying softmax before selecting the top-k when k is 1,
-            # since softmax on a [num_tokens, 1] would yield a zero gradient.
-            raise ValueError("Please use --moe-router-pre-softmax when topk is 1.")
-        assert (
-            moe_router_topk_scaling_factor is None
-        ), "moe_router_topk_scaling_factor is not supported with post-softmax"
-        if moe_router_topk_limited_devices:
-            if num_node_group:
-                scores, top_indices = node_limited_topk(
-                    logits, topk, num_tokens, num_experts, moe_router_topk_limited_devices, num_node_group
-                )
-            else:
-                scores, top_indices = device_limited_topk(
-                    logits, topk, num_tokens, num_experts, moe_router_topk_limited_devices
-                )
-        else:
-            scores, top_indices = torch.topk(logits, k=topk, dim=1)
-        probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
+        raise ValueError(f"Invalid score_function: {score_function}")
 
-    # TODO Try using element-wise operations instead of scatter?
+    if scaling_factor:
+        probs = probs * scaling_factor
+
     topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
     topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
     tokens_per_expert = topk_map.sum(dim=0)
 
     if capacity_factor is None:
-        # TopK without capacity
         return topk_masked_gates, topk_map, tokens_per_expert
     elif device_level_capacity:
-        assert drop_policy=='probs', f"only support 'probs' for device_level capacity, but get {drop_policy}"
-        num_group = (
-        parallel_state.get_expert_model_parallel_world_size()
-        )  # num_group equals to expert parallel size
+        assert drop_policy == "probs", f"only support 'probs' for device_level capacity, but get {drop_policy}"
+        num_group = parallel_state.get_expert_model_parallel_world_size()
         device_expert_capacity = get_capacity(
             num_tokens=num_tokens * topk, num_experts=num_experts, capacity_factor=capacity_factor
-        )*num_experts//num_group
-        # Maskout exceeded tokens
-        if drop_policy == "probs":
-            topk_masked_group_gates = topk_masked_gates.view(num_tokens, num_group, -1)
-            topk_masked_group_gates = topk_masked_group_gates.permute(0,2,1).reshape(-1, num_group)
-            _, capacity_indices = torch.topk(
-                topk_masked_group_gates, k=device_expert_capacity, dim=0, sorted=False
-            )
-            capacity_mask = torch.zeros([num_tokens*num_experts//num_group, num_group], device=logits.device).scatter(0, capacity_indices, 1).bool()
-            capacity_mask = capacity_mask.view(num_tokens, num_experts//num_group, num_group).permute(0,2,1).reshape(num_tokens, -1)
-        else:
-            raise ValueError(f"Invalid drop_policy: {drop_policy}")
-
+        ) * num_experts // num_group
+        topk_masked_group_gates = topk_masked_gates.view(num_tokens, num_group, -1)
+        topk_masked_group_gates = topk_masked_group_gates.permute(0, 2, 1).reshape(-1, num_group)
+        _, capacity_indices = torch.topk(
+            topk_masked_group_gates, k=device_expert_capacity, dim=0, sorted=False
+        )
+        capacity_mask = torch.zeros(
+            [num_tokens * num_experts // num_group, num_group], device=logits.device
+        ).scatter(0, capacity_indices, 1).bool()
+        capacity_mask = capacity_mask.view(num_tokens, num_experts // num_group, num_group)
+        capacity_mask = capacity_mask.permute(0, 2, 1).reshape(num_tokens, -1)
         if pad_to_capacity:
             final_map = capacity_mask
             final_probs = topk_masked_gates * final_map
         else:
-            # Get exceed mask and maskout exceeded probs and indices
             final_map = torch.logical_and(topk_map, capacity_mask)
             final_probs = topk_masked_gates * final_map
         return final_probs, final_map, tokens_per_expert
     else:
-        # TopK with capacity
         expert_capacity = get_capacity(
             num_tokens=num_tokens * topk, num_experts=num_experts, capacity_factor=capacity_factor
         )
-
-        # Maskout exceeded tokens
         if drop_policy == "probs":
             _, capacity_indices = torch.topk(
                 topk_masked_gates, k=expert_capacity, dim=0, sorted=False
@@ -289,11 +271,60 @@ def topk_softmax_with_capacity(
             final_map = capacity_mask
             final_probs = topk_masked_gates * final_map
         else:
-            # Get exceed mask and maskout exceeded probs and indices
             final_map = torch.logical_and(topk_map, capacity_mask)
             final_probs = topk_masked_gates * final_map
         return final_probs, final_map, tokens_per_expert
 
 
+def reduce_aux_losses_tracker_across_ranks(track_names: Optional[list] = None):
+    """Reduce MoE aux-loss trackers without hanging on dense-only pipeline stages.
+
+    Current Megatron reduces tracker values across the pipeline-parallel group, but
+    a pipeline stage without MoE layers may have an empty local tracker. All ranks
+    in a pipeline group must still enter the same collectives, so create zero
+    placeholders for missing tracker names before reducing.
+    """
+    moe_utils = megatron.core.transformer.moe.moe_utils
+    tracker = moe_utils.get_moe_layer_wise_logging_tracker()
+    pp_group = parallel_state.get_pipeline_model_parallel_group()
+
+    if track_names is None:
+        local_meta = {name: tuple(entry["values"].shape) for name, entry in tracker.items()}
+        pp_world_size = torch.distributed.get_world_size(pp_group)
+        gathered_meta = [None for _ in range(pp_world_size)]
+        torch.distributed.all_gather_object(gathered_meta, local_meta, group=pp_group)
+
+        merged_meta = {}
+        for meta in gathered_meta:
+            if not meta:
+                continue
+            merged_meta.update(meta)
+        track_names = list(merged_meta.keys())
+    else:
+        track_names = list(track_names)
+        merged_meta = {name: tuple(tracker[name]["values"].shape) for name in track_names if name in tracker}
+
+    for name in track_names:
+        if name not in tracker:
+            shape = merged_meta.get(name)
+            if shape is None:
+                continue
+            tracker[name] = {
+                "values": torch.zeros(shape, device=torch.cuda.current_device()),
+                "reduce_group": None,
+                "avg_group": None,
+            }
+
+        values = tracker[name]["values"]
+        torch.distributed.all_reduce(values, group=pp_group)
+        if tracker[name].get("reduce_group") is not None:
+            torch.distributed.all_reduce(values, group=tracker[name].get("reduce_group"))
+        if tracker[name].get("avg_group") is not None:
+            torch.distributed.all_reduce(
+                values, group=tracker[name]["avg_group"], op=torch.distributed.ReduceOp.AVG
+            )
+
+
+megatron.core.transformer.moe.moe_utils.reduce_aux_losses_tracker_across_ranks = reduce_aux_losses_tracker_across_ranks
 megatron.core.transformer.moe.moe_utils.sequence_load_balancing_loss_func = sequence_load_balancing_loss_func
 megatron.core.transformer.moe.moe_utils.topk_softmax_with_capacity = topk_softmax_with_capacity

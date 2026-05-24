@@ -370,7 +370,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging)
 
     if iteration % args.log_interval == 0:
-        elapsed_time = timers('interval-time').elapsed(barrier=True)
+        elapsed_time = timers('interval-time').elapsed(barrier=False)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
         throughput = num_floating_point_operations(args, batch_size) / (
@@ -445,7 +445,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
-        timers.log(timers_to_log, normalizer=args.log_interval)
+        if args.timing_log_level > 0:
+            timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag
 

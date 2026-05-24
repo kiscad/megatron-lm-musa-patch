@@ -1,10 +1,11 @@
 import math
 from dataclasses import dataclass
-from typing import Union
+from typing import Optional, Union
 
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     _yarn_get_mscale,
@@ -14,6 +15,7 @@ from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.utils import deprecate_inference_params
 
 from megatron.core.transformer.multi_latent_attention import MLASelfAttentionSubmodules
 
@@ -31,7 +33,8 @@ class MultiLatentAttention(Attention):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        cp_comm_type: str = None,
+        cp_comm_type: Optional[str] = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ) -> None:
         world_size = parallel_state.get_tensor_model_parallel_world_size()
         assert (
@@ -45,6 +48,8 @@ class MultiLatentAttention(Attention):
             layer_number=layer_number,
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
+            cp_comm_type=cp_comm_type,
+            model_comm_pgs=model_comm_pgs,
         )
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
@@ -96,7 +101,7 @@ class MultiLatentAttention(Attention):
         hidden_states,
         attention_mask,
         key_value_states=None,
-        inference_params=None,
+        inference_context=None,
         rotary_pos_emb=None,
         rotary_pos_cos=None,
         rotary_pos_sin=None,
@@ -104,6 +109,8 @@ class MultiLatentAttention(Attention):
         packed_seq_params=None,
         position_ids=None,
         sequence_len_offset=None,
+        *,
+        inference_params=None,
     ):
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."
@@ -113,6 +120,8 @@ class MultiLatentAttention(Attention):
         ), "MLA does not support Flash Decoding"
 
         # hidden_states: [sq, b, h]
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # =====================
         # Query, Key, and Value
@@ -125,15 +134,15 @@ class MultiLatentAttention(Attention):
             key_value_states,
             position_ids,
             packed_seq_params,
-            inference_params=inference_params,
+            inference_params=inference_context,
         )
 
         # ===================================================
         # Adjust key, value for inference
         # ===================================================
         # rotary_pos_emb = None
-        query, key, value, _, attn_mask_type = self._adjust_key_value_for_inference(
-            inference_params, query, key, value, rotary_pos_emb=None
+        query, key, value, _, attn_mask_type, _ = self._adjust_key_value_for_inference(
+            inference_context, query, key, value, rotary_pos_emb=None
         )
 
         # ==================================
@@ -182,7 +191,8 @@ class MLASelfAttention(MultiLatentAttention):
         submodules: MLASelfAttentionSubmodules,
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
-        cp_comm_type: str = None,
+        cp_comm_type: Optional[str] = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         super().__init__(
             config=config,
@@ -190,6 +200,8 @@ class MLASelfAttention(MultiLatentAttention):
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
             attention_type="self",
+            cp_comm_type=cp_comm_type,
+            model_comm_pgs=model_comm_pgs,
         )
 
         if self.config.q_lora_rank is None:
